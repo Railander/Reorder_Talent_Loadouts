@@ -1455,6 +1455,20 @@ do
     Constants = savedConstants
 end
 
+-- Test 41: reset button survives its own outside-click (deferred hide + menu reopen)
+do
+    local f = io.open("Reorder_Talent_Loadouts.lua", "r")
+    local source = f:read("*a")
+    f:close()
+
+    assert_true(source:find("C_Timer.After(0.35", 1, true) ~= nil,
+        "Reset button hide is deferred on menu close (immediate hide cancels the in-flight click)")
+    assert_true(source:find("dd:OpenMenu()", 1, true) ~= nil,
+        "Reset button reopens the dropdown after resetting (menu must not collapse on click)")
+    assert_true(source:find('ns.ResetCurrentSpecOrder(false)', 1, true) ~= nil,
+        "Button reset is silent (no chat spam); visual feedback is the reopened dropdown")
+end
+
 print(string.format("\nTest Results: %d Passed, %d Failed", passed, failed))
 if failed > 0 then
     os.exit(1)

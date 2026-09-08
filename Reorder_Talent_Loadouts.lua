@@ -1007,6 +1007,10 @@ end
 
 local resetButton = nil;
 
+local function ddOpen(dropdown)
+    return dropdown and dropdown.IsMenuOpen and dropdown:IsMenuOpen();
+end
+
 -- Icon button styled after the talents pane's "Undo Pending Changes" button
 -- (IconButtonTemplate + talents-button-undo), shown only while the loadout dropdown is open.
 local function CreateResetButton(talentsFrame)
@@ -1034,13 +1038,22 @@ local function CreateResetButton(talentsFrame)
     btn:SetPoint("RIGHT", dropdown, "LEFT", -6, 0);
     btn:Hide();
 
-    if btn.SetOnClickHandler then
-        btn:SetOnClickHandler(function()
-            ns.ResetCurrentSpecOrder(true);
+    -- Click: reset, then keep the dropdown open showing the result. Clicking the button is
+    -- an outside click for the open menu, so the menu closes on mouse-down; reopening here
+    -- (OpenMenu regenerates) makes the dropdown appear to never collapse.
+    btn:SetOnClickHandler(function()
+        SafeInvoke("resetButton", function()
+            ns.ResetCurrentSpecOrder(false);
+            local talentsFrame = GetTalentsFrame();
+            local loadSystem = talentsFrame and talentsFrame.LoadSystem;
+            local dd = loadSystem and loadSystem.GetDropdown and loadSystem:GetDropdown();
+            if dd and dd.IsMenuOpen and not dd:IsMenuOpen() and dd.OpenMenu then
+                dd:OpenMenu();
+            elseif dd and dd.GenerateMenu then
+                dd:GenerateMenu();
+            end
         end);
-    else
-        btn:SetScript("OnClick", function() ns.ResetCurrentSpecOrder(true); end);
-    end
+    end);
 
     -- Tooltip (own button; plain script is fine here)
     btn:SetScript("OnEnter", function(self)
@@ -1056,12 +1069,23 @@ local function CreateResetButton(talentsFrame)
     end);
 
     -- Show only while the loadout dropdown's menu is open (sanctioned pub-sub callbacks).
+    -- NOTE: the hide is deferred. Clicking this button itself closes the menu on mouse-down
+    -- (outside click); hiding immediately would cancel the in-flight click before OnClick
+    -- fires, so the button stays visible briefly and hides once the click has landed.
     if dropdown.RegisterCallback and DropdownButtonMixin and DropdownButtonMixin.Event then
         pcall(dropdown.RegisterCallback, dropdown, DropdownButtonMixin.Event.OnMenuOpen, function()
-            btn:Show();
+            btn:SetShown(true);
         end);
         pcall(dropdown.RegisterCallback, dropdown, DropdownButtonMixin.Event.OnMenuClose, function()
-            btn:Hide();
+            if C_Timer and C_Timer.After then
+                C_Timer.After(0.35, function()
+                    if not (ddOpen and ddOpen(dropdown)) then
+                        btn:SetShown(false);
+                    end
+                end);
+            else
+                btn:SetShown(false);
+            end
         end);
     end
 
