@@ -1,6 +1,6 @@
 # Reorder Talent Loadouts
 
-A lightweight World of Warcraft (Retail) addon that adds drag-and-drop reordering to the talent loadout dropdown. Nothing else.
+A lightweight World of Warcraft addon that adds drag-and-drop reordering functionality to the talent loadout dropdown.
 
 ![preview](preview.gif)
 
@@ -18,8 +18,8 @@ An undo-arrow button next to the dropdown (visible only while it's open and you'
 
 ## Compatibility
 
-Retail WoW Midnight (12.x). Drag is aborted automatically when entering combat (WoW rule, not a limitation).
+WoW Midnight (12.x). Drag is aborted automatically when entering combat (WoW rule, not a limitation).
 
 ## License
 
-GNU General Public License v3.0. See [LICENSE](LICENSE) for details.
+GNU General Public License v2.0. See [LICENSE](LICENSE) for details.
