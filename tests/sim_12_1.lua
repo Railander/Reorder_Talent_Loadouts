@@ -455,7 +455,6 @@ ok(count3 ~= nil and count3 >= 4, "menu still generates", count3);
 print("\n== Sim 5: fresh frame open (no-hook design: poller/OnRefreshLoadoutOptions applies saved order) ==");
 print("  [trace] MENU_CLASS_TALENT_PROFILE modify-callback invocations so far: " .. modifyCalls);
 for _, h in ipairs(hookCalls) do print("  [trace] hooksecurefunc -> " .. h); end
-for k, v in pairs(ReorderTalentLoadoutsDebug.log) do print("  [log] " .. k .. ": " .. tostring(v)); end
 do
     local pk = ns.GetPlayerKey();
     local dbEntry = ReorderTalentLoadoutsDB[pk] and ReorderTalentLoadoutsDB[pk][SPEC_ID];
@@ -465,7 +464,6 @@ do
     for i, id in ipairs(loadSystem.possibleSelections) do cur[i] = id; end
     local sorted = ns.SortConfigIDs(SPEC_ID, cur, talentsFrame.configIDToName);
     print("  DEBUG SortConfigIDs direct: " .. table.concat(sorted or {}, ","));
-    for scope, err in pairs(ReorderTalentLoadoutsDebug.errors) do print("  CAPTURED[" .. scope .. "] " .. tostring(err)); end
 end
 talentsFrame.configIDs = nil;
 talentsFrame.configIDToName = nil;

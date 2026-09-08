@@ -665,9 +665,9 @@ do
         if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
     end
 
-    -- Mouse down via the GLOBAL_MOUSE_DOWN event path
+    -- Mouse down via the button's own post-hook
     cursorX, cursorY = 100, 100
-    evFrame.scripts["OnEvent"](evFrame, "GLOBAL_MOUSE_DOWN", "LeftButton")
+    bTest.scripts["OnMouseDown"](bTest, "LeftButton")
 
     -- Mouse moves only 2 pixels (distance < 5px)
     cursorX, cursorY = 101, 101
@@ -682,8 +682,7 @@ do
     -- Verify drag did NOT start
     assert_true(bTest:GetAlpha() == 1.0, "Movement <= 5px does not start drag")
 
-    -- Mouse up via the GLOBAL_MOUSE_UP event path
-    evFrame.scripts["OnEvent"](evFrame, "GLOBAL_MOUSE_UP", "LeftButton")
+    addonNamespace.CancelDrag()
     leftMouseDown = false
     assert_true(bTest:GetAlpha() == 1.0, "Button remains in normal state after normal click")
 end
@@ -726,7 +725,7 @@ do
     for _, f in ipairs(mockFrames) do
         if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
     end
-    evFrame.scripts["OnEvent"](evFrame, "GLOBAL_MOUSE_DOWN", "LeftButton")
+    rowBtn.scripts["OnMouseDown"](rowBtn, "LeftButton")
     cursorX, cursorY = 150, 150
     leftMouseDown = true
     evFrame.scripts["OnUpdate"](evFrame, 0.016)
@@ -735,7 +734,7 @@ do
     addonNamespace.CancelDrag()
 end
 
--- Test 18: GLOBAL_MOUSE_DOWN Event Detection
+-- Test 18: Button Press Arms Click-and-Hold Drag
 do
     addonNamespace.ClearActiveButtons()
     local gBtn = CreateFrame("Button", "GlobalMouseBtn")
@@ -754,14 +753,14 @@ do
     cursorX = 100
     cursorY = 210
     leftMouseDown = true
-    evFrame.scripts["OnEvent"](evFrame, "GLOBAL_MOUSE_DOWN", "LeftButton")
+    gBtn.scripts["OnMouseDown"](gBtn, "LeftButton")
 
     -- Move mouse > 5px
     cursorX = 120
     cursorY = 210
     evFrame.scripts["OnUpdate"](evFrame, 0.016)
 
-    assert_true(gBtn:GetAlpha() == 0.35, "GLOBAL_MOUSE_DOWN successfully triggered drag on loadout button")
+    assert_true(gBtn:GetAlpha() == 0.35, "Button press successfully armed click-and-hold drag")
     addonNamespace.CancelDrag()
     assert_true(gBtn:GetAlpha() == 1.0, "Drag cleaned up after GLOBAL_MOUSE_DOWN test")
     leftMouseDown = false
@@ -1100,7 +1099,8 @@ do
     assert_true(content:find("## IconTexture: 132222") ~= nil, "TOC uses icon file data ID 132222")
     assert_true(content:find("## Author: railander") ~= nil, "TOC author matches project convention")
     assert_true(content:find("SavedVariables: ReorderTalentLoadoutsDB") ~= nil, "TOC keeps the SavedVariables declarations")
-    assert_true(content:find("OptionalDeps: Blizzard_PlayerSpells") ~= nil, "TOC keeps the Blizzard load-order deps")
+    assert_true(content:find("OptionalDeps") == nil, "TOC has no OptionalDeps (Blizzard_PlayerSpells is load-on-demand; hooks install lazily)")
+    assert_true(content:find("SavedVariables: ReorderTalentLoadoutsDB") ~= nil and content:find("ReorderTalentLoadoutsDebug") == nil, "TOC saves only the order DB")
     assert_true(content:find("Reorder_Talent_Loadouts.lua") ~= nil, "TOC loads the addon lua")
 end
 
