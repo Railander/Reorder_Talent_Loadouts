@@ -1,12 +1,11 @@
-## Interface: 120100
+## Interface: 120000, 120100
+## Version: @project-version@
 ## Title: Reorder Talent Loadouts
-## Notes: Reorder talent loadouts by simply click-and-holding and moving them in the loadout dropdown.
-## Author: Railander
-## Version: 1.4.4
+## Notes: Super lightweight addon that adds drag-and-drop reordering to the talent loadout dropdown.
+## Author: railander
+## IconTexture: 132222
+## X-Curse-Project-ID: 1687554
 ## SavedVariables: ReorderTalentLoadoutsDB, ReorderTalentLoadoutsDebug
 ## OptionalDeps: Blizzard_PlayerSpells, Blizzard_ClassTalentUI
-## IconTexture: Interface\Icons\INV_Misc_Book_09
-## Category-enUS: Class & Talents
-## DefaultState: Enabled
 
 Reorder_Talent_Loadouts.lua
