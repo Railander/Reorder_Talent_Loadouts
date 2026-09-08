@@ -1,0 +1,11 @@
+package-as: Reorder_Talent_Loadouts
+enable-nolib-creation: no
+
+ignore:
+    - LICENSE
+    - README.md
+    - preview.gif
+    - .pkgmeta
+    - .gitignore
+    - .gitattributes
+    - .github
