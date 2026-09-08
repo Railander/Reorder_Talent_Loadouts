@@ -10,15 +10,10 @@ local ADDON_NAME, ns = ...;
 -- Global Database
 ReorderTalentLoadoutsDB = ReorderTalentLoadoutsDB or {};
 
--- Diagnostics: persisted so failures can be inspected after a session (/rtl debug).
 -- The addon is built fail-open: an internal error must never break Blizzard's menu
--- generation or the talent frame init chain; it is captured and reported instead.
-ReorderTalentLoadoutsDebug = ReorderTalentLoadoutsDebug or { errors = {}, log = {} };
-local diag = ReorderTalentLoadoutsDebug;
-
-local function DebugNote(key, text)
-	diag.log[key] = text;
-end
+-- generation or the talent frame init chain; errors are reported to chat (once per
+-- scope) and swallowed.
+local reportedErrors = {};
 
 local unpack = unpack or table.unpack;
 
@@ -41,8 +36,8 @@ local function SafeInvoke(scope, fn, ...)
 	end, unpack(args, 1, n)) };
 	if not results[1] then
 		local err = tostring(results[2] or "unknown error");
-		if not diag.errors[scope] then
-			diag.errors[scope] = err;
+		if not reportedErrors[scope] then
+			reportedErrors[scope] = err;
 			if DEFAULT_CHAT_FRAME then
 				DEFAULT_CHAT_FRAME:AddMessage("|cffff3333Reorder Talent Loadouts [" .. scope .. "] error:|r " .. err);
 			end
@@ -697,10 +692,7 @@ local InitializeTalentHooks;
 local function OnModifyTalentMenuInner(ownerRegion, rootDescription, contextData)
     local talentsFrame = GetTalentsFrame(ownerRegion);
     local loadSystem = (talentsFrame and talentsFrame.LoadSystem) or GetLoadSystem(ownerRegion);
-    if not loadSystem then
-        DebugNote("menuCallback", "ran but no loadSystem was resolved (talent frame not found)");
-        return
-    end
+    if not loadSystem then return end
     if talentsFrame and talentsFrame.IsInspecting and talentsFrame:IsInspecting() then return end
 
     if talentsFrame then
@@ -733,12 +725,10 @@ local function OnModifyTalentMenuInner(ownerRegion, rootDescription, contextData
         end);
     end
 
-    local matched, enhanced = 0, 0;
     for index, desc in rootDescription:EnumerateElementDescriptions() do
         if desc and desc.GetData then
             local data = desc:GetData();
             if data and selectionSet[data] then
-                matched = matched + 1;
                 -- This description represents a loadout entry!
                 local ok = SafeInvoke("menu-element", function()
                     -- Suppress click selection during drag
@@ -774,19 +764,12 @@ local function OnModifyTalentMenuInner(ownerRegion, rootDescription, contextData
                         ns.SetupLoadoutButton(button, description, menu, data);
                     end);
                 end);
-                if ok then
-                    enhanced = enhanced + 1;
-                end
             end
         end
     end
-
-    DebugNote("menuCallback", ("ran: possibleSelections=%d, loadout elements matched=%d, enhanced=%d")
-        :format(#possibleSelections, matched, enhanced));
 end
 
 local function OnModifyTalentMenu(ownerRegion, rootDescription, contextData)
-    diag.menuCallbacks = (diag.menuCallbacks or 0) + 1;
     -- Fail-open: an error in this callback would abort Blizzard's GenerateMenu, which is
     -- exactly what blanking the dropdown looks like. Capture and continue instead.
     SafeInvoke("menu", OnModifyTalentMenuInner, ownerRegion, rootDescription, contextData);
@@ -797,6 +780,7 @@ end
 -- ----------------------------------------------------------------------------
 
 local hooksInstalled = false;
+local showHookInstalled = false;
 
 local function OnRefreshLoadoutOptionsInner(talentsFrame)
     if not talentsFrame or not talentsFrame.LoadSystem then return end
@@ -919,8 +903,6 @@ local function ReconcileInner()
     local after = loadSystem.possibleSelections;
     if after and #after > 1 then
         OnRefreshLoadoutOptions(talentsFrame);
-        DebugNote("reconcile", ("selections=[%s], missing restored=%d")
-            :format(table.concat(after, ","), #missing));
     end
 
     if UpdateResetButton then UpdateResetButton(); end
@@ -1119,40 +1101,18 @@ end
 local function InitializeTalentHooksInner()
     local talentsFrame = GetTalentsFrame();
     if not talentsFrame or not talentsFrame.LoadSystem then
-        DebugNote("initHooks", "deferred: talent frame or LoadSystem not found yet");
         return
     end
 
     hooksInstalled = true;
 
-    -- IMPORTANT (WoW 12.1+ taint rules): the addon contains ZERO secure hooks.
-    -- Hooking a Blizzard Lua method injects addon taint into Blizzard's execution, and even
-    -- hooking a SecretArguments-protected C function (C_ClassTalents.GetConfigIDsBySpecID)
-    -- was observed in-game to degrade its results: Blizzard's own calls then return empty
-    -- and the loadout list collapses to nothing. The addon therefore only ever:
-    --   * registers via Menu.ModifyMenu (the sanctioned customization API), and
-    --   * mutates loadout DATA (possibleSelections) from its own execution (the poller).
-    -- Sorting is handled by the OnUpdate poller and the initial sort below.
-
-    -- Self-test: what does the restricted API return from pure addon execution?
-    -- (Repeated a few times after login; no hooks involved.)
-    if C_Timer and C_Timer.After then
-        local selfTestAttempt = 0;
-        local function RunSelfTest()
-            selfTestAttempt = selfTestAttempt + 1;
-            local specID = PlayerUtil and PlayerUtil.GetCurrentSpecID and PlayerUtil.GetCurrentSpecID();
-            if specID and C_ClassTalents and C_ClassTalents.GetConfigIDsBySpecID then
-                local ok, ids = pcall(C_ClassTalents.GetConfigIDsBySpecID, specID);
-                local detail = ok and type(ids) == "table" and ("n=" .. #ids .. " [" .. table.concat(ids, ",") .. "]") or tostring(ids);
-                DebugNote("selfTest", ("attempt %d, spec=%s, ok=%s, %s")
-                    :format(selfTestAttempt, tostring(specID), tostring(ok), detail));
-            end
-            if selfTestAttempt < 3 then
-                C_Timer.After(8, RunSelfTest);
-            end
-        end
-        C_Timer.After(8, RunSelfTest);
-    end
+    -- IMPORTANT (WoW 12.x taint rules): the addon contains ZERO secure hooks. Hooking a
+    -- Blizzard Lua method injects addon taint into Blizzard's execution, and even hooking a
+    -- SecretArguments-protected C function (C_ClassTalents.GetConfigIDsBySpecID) was
+    -- observed in-game to degrade its results, collapsing the loadout list. The addon only
+    -- ever registers via Menu.ModifyMenu (the sanctioned customization API) and mutates
+    -- loadout DATA (possibleSelections) from its own execution. Reconciliation is
+    -- event-driven and the initial sort runs below.
 
     -- Apply initial sort if options already exist
     local loadSystem = talentsFrame.LoadSystem;
@@ -1163,19 +1123,33 @@ local function InitializeTalentHooksInner()
     -- Reset-order button (undo-arrow icon), visible only while the dropdown is open.
     resetButton = CreateResetButton(talentsFrame) or resetButton;
 
-    DebugNote("initHooks", "installed: reconciler + reset button + self-test (no secure hooks)");
+    -- Reconcile the moment the talent pane becomes visible. Without this, the first
+    -- dropdown open after a reload shows Blizzard's default order: the pane's first
+    -- population fires no TRAIT_CONFIG event we can react to, and our menu callback can
+    -- only sort data that the description being generated has already consumed. OnShow
+    -- runs after that population and before any human can open the dropdown, so the
+    -- first paint already uses the saved order.
+    if talentsFrame.HookScript and not showHookInstalled then
+        showHookInstalled = true;
+        talentsFrame:HookScript("OnShow", function()
+            ns.Reconcile();
+        end);
+    end
 end
 
 -- Assign the forward-declared local (captured by OnModifyTalentMenuInner); do not shadow it.
 InitializeTalentHooks = function()
     if hooksInstalled then return end
 
-    diag.initAttempts = (diag.initAttempts or 0) + 1;
     -- Fail-open: hook installation must never raise into Blizzard's load flow.
     SafeInvoke("initHooks", InitializeTalentHooksInner);
 end
 
 ns.InitializeTalentHooks = InitializeTalentHooks;
+ns._ResetHookStateForTest = function() -- private-suite seam: re-run installation
+    hooksInstalled = false;
+    showHookInstalled = false;
+end
 
 -- ----------------------------------------------------------------------------
 -- Core Event Controller Frame
@@ -1196,8 +1170,6 @@ eventFrame:RegisterEvent("ADDON_LOADED");
 eventFrame:RegisterEvent("PLAYER_LOGIN");
 eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD");
 eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED");
-eventFrame:RegisterEvent("GLOBAL_MOUSE_DOWN");
-eventFrame:RegisterEvent("GLOBAL_MOUSE_UP");
 -- The same events Blizzard's ClassTalentFrame uses to drive the loadout dropdown.
 eventFrame:RegisterEvent("TRAIT_CONFIG_LIST_UPDATED");
 eventFrame:RegisterEvent("TRAIT_CONFIG_CREATED");
@@ -1207,11 +1179,6 @@ eventFrame:RegisterEvent("ACTIVE_PLAYER_SPECIALIZATION_CHANGED");
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
-            ReorderTalentLoadoutsDB = ReorderTalentLoadoutsDB or {};
-            -- Keep last session's diagnostics for /rtl debug, but start fresh capture.
-            ReorderTalentLoadoutsDebug.last = { errors = ReorderTalentLoadoutsDebug.errors, log = ReorderTalentLoadoutsDebug.log };
-            ReorderTalentLoadoutsDebug.errors = {};
-            ReorderTalentLoadoutsDebug.log = {};
             if IsAddOnLoadedSafe("Blizzard_PlayerSpells") or IsAddOnLoadedSafe("Blizzard_ClassTalentUI") then
                 InitializeTalentHooks();
             end
@@ -1219,7 +1186,6 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
             InitializeTalentHooks();
         end
     elseif event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" then
-        ReorderTalentLoadoutsDB = ReorderTalentLoadoutsDB or {};
         if IsAddOnLoadedSafe("Blizzard_PlayerSpells") or IsAddOnLoadedSafe("Blizzard_ClassTalentUI") then
             InitializeTalentHooks();
         end
@@ -1248,28 +1214,6 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
     elseif event == "PLAYER_REGEN_DISABLED" then
         -- Cancel any drag operations when entering combat
         ns.CancelDrag();
-    elseif event == "GLOBAL_MOUSE_DOWN" then
-        local buttonName = arg1;
-        if buttonName == "LeftButton" and not (InCombatLockdown and InCombatLockdown()) then
-            for _, entry in ipairs(trackedButtons) do
-                local btn = entry.button;
-                if btn.IsShown and btn:IsShown() and btn.IsMouseOver and btn:IsMouseOver() then
-                    if not IsMouseOverUtilityButton(btn) then
-                        potentialDrag = true;
-                        dragSourceButton = btn;
-                        dragSourceConfigID = entry.configID;
-                        dragStartX, dragStartY = GetCursorPosition();
-                    end
-                    break;
-                end
-            end
-        end
-    elseif event == "GLOBAL_MOUSE_UP" then
-        if isDragging then
-            ns.FinishDrag();
-        else
-            potentialDrag = false;
-        end
     end
 end);
 
@@ -1301,9 +1245,7 @@ eventFrame:SetScript("OnUpdate", function(self, elapsed)
 end);
 
 -- Register with Blizzard Menu framework (available in 11.0+).
--- The returned handle allows live unregistration for in-game bisecting (/rtl nomenu, /rtl menu).
-local menuModifyHandle;
 if Menu and Menu.ModifyMenu then
-    menuModifyHandle = Menu.ModifyMenu("MENU_CLASS_TALENT_PROFILE", OnModifyTalentMenu);
+    Menu.ModifyMenu("MENU_CLASS_TALENT_PROFILE", OnModifyTalentMenu);
 end
 
