@@ -55,12 +55,24 @@ end
 -- ----------------------------------------------------------------------------
 
 function ns.GetSavedOrder(playerKey, specID)
-    if not ReorderTalentLoadoutsDB or not playerKey or not specID then
+    if not ReorderTalentLoadoutsDB or not specID then
         return nil;
     end
-    local charData = ReorderTalentLoadoutsDB[playerKey];
-    if not charData then return nil; end
-    return charData[specID];
+    if playerKey and ReorderTalentLoadoutsDB[playerKey] and ReorderTalentLoadoutsDB[playerKey][specID] then
+        return ReorderTalentLoadoutsDB[playerKey][specID];
+    end
+    -- Fallback: check Name-Realm if playerKey was GUID or vice-versa
+    if UnitName and GetRealmName then
+        local name = UnitName("player");
+        local realm = GetRealmName();
+        if name and realm and name ~= "" and realm ~= "" then
+            local altKey = name .. "-" .. realm;
+            if altKey ~= playerKey and ReorderTalentLoadoutsDB[altKey] and ReorderTalentLoadoutsDB[altKey][specID] then
+                return ReorderTalentLoadoutsDB[altKey][specID];
+            end
+        end
+    end
+    return nil;
 end
 
 function ns.SaveOrder(playerKey, specID, orderList, configIDToName)
@@ -145,7 +157,12 @@ function ns.SortConfigIDs(specID, currentConfigIDs, configIDToName)
         end
     end
 
-    -- If any IDs were updated/added, update the saved DB
+    -- If any saved IDs were deleted, or count changed, mark changed so DB is purged
+    if #saved.order ~= #result then
+        changed = true;
+    end
+
+    -- If any IDs were updated/added/purged, update the saved DB
     if changed and #result > 0 then
         ns.SaveOrder(playerKey, specID, result, configIDToName);
     end
@@ -347,17 +364,23 @@ function ns.UpdateDrag()
         return;
     end
 
-    -- Check horizontal bounds relative to the loadout rows
+    -- Check bounds relative to the loadout rows
     local firstBtn = activeLoadoutButtons[1];
+    local lastBtn = activeLoadoutButtons[totalButtons];
     local bLeft, bBottom, bWidth, bHeight = firstBtn:GetRect();
-    if not bLeft then
+    local lastLeft, lastBottom, lastWidth, lastHeight = lastBtn:GetRect();
+    if not bLeft or not lastBottom then
         insertionLine:Hide();
         currentDropTargetIndex = nil;
         return;
     end
 
-    -- If cursor is moved too far away horizontally (> 120px off), cancel drop indication
-    if cursorX < (bLeft - 120) or cursorX > (bLeft + bWidth + 120) then
+    local menuTop = bBottom + (bHeight or 0);
+    local menuBottom = lastBottom;
+
+    -- If cursor is moved too far away horizontally (> 120px) or vertically (> 60px), cancel drop indication
+    if cursorX < (bLeft - 120) or cursorX > (bLeft + bWidth + 120)
+       or cursorY > (menuTop + 60) or cursorY < (menuBottom - 60) then
         insertionLine:Hide();
         currentDropTargetIndex = nil;
         return;
@@ -406,7 +429,7 @@ function ns.FinishDrag()
 
     -- Suppress click handling for a brief moment after releasing drag
     if C_Timer and C_Timer.After then
-        C_Timer.After(0.15, function()
+        C_Timer.After(0.2, function()
             justFinishedDragging = false;
         end);
     else
@@ -486,7 +509,11 @@ function ns.FinishDrag()
 
     -- Seamlessly refresh the dropdown to display the new order immediately
     local dropdown = loadSystem.GetDropdown and loadSystem:GetDropdown();
-    if dropdown and dropdown.CloseMenu and dropdown.OpenMenu then
+    if dropdown and dropdown.GenerateMenu then
+        dropdown:GenerateMenu();
+    elseif loadSystem.UpdateSelectionOptions then
+        loadSystem:UpdateSelectionOptions();
+    elseif dropdown and dropdown.CloseMenu and dropdown.OpenMenu then
         dropdown:CloseMenu();
         dropdown:OpenMenu();
     end
@@ -498,7 +525,7 @@ function ns.CancelDrag()
         potentialDrag = false;
         justFinishedDragging = true;
         if C_Timer and C_Timer.After then
-            C_Timer.After(0.15, function()
+            C_Timer.After(0.2, function()
                 justFinishedDragging = false;
             end);
         else
@@ -526,6 +553,17 @@ end
 -- Button Setup & Menu Hook
 -- ----------------------------------------------------------------------------
 
+local function IsMouseOverUtilityButton(button)
+    if not button or not button.GetChildren then return false; end
+    local children = { button:GetChildren() };
+    for _, child in ipairs(children) do
+        if child and child.IsMouseOver and child:IsMouseOver() and (not child.IsShown or child:IsShown()) then
+            return true;
+        end
+    end
+    return false;
+end
+
 function ns.SetupLoadoutButton(button, description, menu, configID)
     button.rtLoadoutConfigID = configID;
     button.rtLoadoutDesc = description;
@@ -543,37 +581,16 @@ function ns.SetupLoadoutButton(button, description, menu, configID)
         table.insert(activeLoadoutButtons, button);
     end
 
-    if not button.rtDragHooked then
-        button.rtDragHooked = true;
-
-        button:HookScript("OnMouseDown", function(self, mouseButton)
-            if mouseButton == "LeftButton" and not (InCombatLockdown and InCombatLockdown()) then
-                -- Ignore clicks on the gear edit button
-                if self.gearButton and self.gearButton.IsMouseOver and self.gearButton:IsMouseOver() then
-                    return;
-                end
-
-                potentialDrag = true;
-                dragSourceButton = self;
-                dragSourceConfigID = self.rtLoadoutConfigID;
-                dragStartX, dragStartY = GetCursorPosition();
-            end
-        end);
-
-        button:HookScript("OnMouseUp", function(self, mouseButton)
-            if mouseButton == "LeftButton" then
-                if isDragging then
-                    ns.FinishDrag();
-                else
-                    potentialDrag = false;
-                end
-            end
-        end);
-
+    -- ALWAYS re-arm drag on pooled buttons every time they are initialized from the pool
+    if button.RegisterForDrag then
         button:RegisterForDrag("LeftButton");
+    end
+    if button.SetScript then
         button:SetScript("OnDragStart", function(self)
             if not (InCombatLockdown and InCombatLockdown()) then
-                ns.StartDrag(self);
+                if not IsMouseOverUtilityButton(self) then
+                    ns.StartDrag(self);
+                end
             end
         end);
         button:SetScript("OnDragStop", function(self)
@@ -581,6 +598,35 @@ function ns.SetupLoadoutButton(button, description, menu, configID)
                 ns.FinishDrag();
             end
         end);
+    end
+
+    if not button.rtDragHooked then
+        button.rtDragHooked = true;
+
+        if button.HookScript then
+            button:HookScript("OnMouseDown", function(self, mouseButton)
+                if mouseButton == "LeftButton" and not (InCombatLockdown and InCombatLockdown()) then
+                    if IsMouseOverUtilityButton(self) then
+                        return;
+                    end
+
+                    potentialDrag = true;
+                    dragSourceButton = self;
+                    dragSourceConfigID = self.rtLoadoutConfigID;
+                    dragStartX, dragStartY = GetCursorPosition();
+                end
+            end);
+
+            button:HookScript("OnMouseUp", function(self, mouseButton)
+                if mouseButton == "LeftButton" then
+                    if isDragging then
+                        ns.FinishDrag();
+                    else
+                        potentialDrag = false;
+                    end
+                end
+            end);
+        end
     end
 end
 
@@ -599,9 +645,18 @@ local function OnModifyTalentMenu(ownerRegion, rootDescription, contextData)
     -- Clear active buttons for the newly generated menu instance
     wipe(activeLoadoutButtons);
 
+    -- Auto-cancel drag and cleanup when the menu is released/closed
+    if rootDescription.AddMenuReleasedCallback then
+        rootDescription:AddMenuReleasedCallback(function()
+            ns.CancelDrag();
+            ns.ClearActiveButtons();
+        end);
+    end
+
     for index, desc in rootDescription:EnumerateElementDescriptions() do
-        local data = desc:GetData();
-        if data and selectionSet[data] then
+        if desc and desc.GetData then
+            local data = desc:GetData();
+            if data and selectionSet[data] then
             -- This description represents a loadout entry!
             -- Suppress click selection during drag
             desc:SetCanSelect(function()
@@ -611,9 +666,24 @@ local function OnModifyTalentMenu(ownerRegion, rootDescription, contextData)
                 return true;
             end);
 
+            -- Suppress click sound when dragging or immediately after dropping
+            local origSoundKit = desc.GetSoundKit and desc:GetSoundKit();
+            desc:SetSoundKit(function(elementDesc)
+                if isDragging or justFinishedDragging then
+                    return 0;
+                end
+                if type(origSoundKit) == "function" then
+                    return origSoundKit(elementDesc);
+                elseif type(origSoundKit) == "number" then
+                    return origSoundKit;
+                end
+                return (SOUNDKIT and SOUNDKIT.U_CHAT_SCROLL_BUTTON) or 0;
+            end);
+
             desc:AddInitializer(function(button, description, menu)
                 ns.SetupLoadoutButton(button, description, menu, data);
             end);
+            end
         end
     end
 end
@@ -679,6 +749,17 @@ local function InitializeTalentHooks()
         talentsFrame:HookScript("OnHide", ns.CancelDrag);
     end
 
+    -- Hook Dropdown menu close callback to cancel any active drag
+    local loadSystem = talentsFrame.LoadSystem;
+    local dropdown = loadSystem.GetDropdown and loadSystem:GetDropdown();
+    if dropdown and dropdown.RegisterCallback then
+        local onMenuCloseEvent = (DropdownButtonMixin and DropdownButtonMixin.Event and DropdownButtonMixin.Event.OnMenuClose) or "OnMenuClose";
+        pcall(dropdown.RegisterCallback, dropdown, onMenuCloseEvent, function()
+            ns.CancelDrag();
+            ns.ClearActiveButtons();
+        end);
+    end
+
     -- Apply initial sort if options already exist
     OnRefreshLoadoutOptions(talentsFrame);
 end
@@ -691,6 +772,7 @@ local eventFrame = CreateFrame("Frame", "ReorderTalentLoadoutsEventFrame");
 eventFrame:RegisterEvent("ADDON_LOADED");
 eventFrame:RegisterEvent("PLAYER_LOGIN");
 eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED");
+eventFrame:RegisterEvent("GLOBAL_MOUSE_DOWN");
 eventFrame:RegisterEvent("GLOBAL_MOUSE_UP");
 
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
@@ -711,6 +793,21 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
     elseif event == "PLAYER_REGEN_DISABLED" then
         -- Cancel any drag operations when entering combat
         ns.CancelDrag();
+    elseif event == "GLOBAL_MOUSE_DOWN" then
+        local buttonName = arg1;
+        if buttonName == "LeftButton" and not (InCombatLockdown and InCombatLockdown()) then
+            for _, btn in ipairs(activeLoadoutButtons) do
+                if btn:IsShown() and btn.IsMouseOver and btn:IsMouseOver() then
+                    if not IsMouseOverUtilityButton(btn) then
+                        potentialDrag = true;
+                        dragSourceButton = btn;
+                        dragSourceConfigID = btn.rtLoadoutConfigID;
+                        dragStartX, dragStartY = GetCursorPosition();
+                    end
+                    break;
+                end
+            end
+        end
     elseif event == "GLOBAL_MOUSE_UP" then
         if isDragging then
             ns.FinishDrag();

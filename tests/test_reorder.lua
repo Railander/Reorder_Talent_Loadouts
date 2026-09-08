@@ -84,6 +84,14 @@ C_Timer = {
 
 SOUNDKIT = {
     IG_MAINMENU_OPTION_CHECKBOX_ON = 856,
+    U_CHAT_SCROLL_BUTTON = 857,
+};
+
+DropdownButtonMixin = {
+    Event = {
+        OnMenuOpen = "OnMenuOpen",
+        OnMenuClose = "OnMenuClose",
+    },
 };
 
 local playedSounds = {};
@@ -173,6 +181,26 @@ function CreateFrame(frameType, name, parent, template)
             end
         end,
         RegisterForDrag = function(self, ...) self.registeredDrag = {...} end,
+        IsMouseOver = function(self)
+            if self.mouseOverOverride ~= nil then return self.mouseOverOverride end
+            local l, b, w, h = self.rect.left, self.rect.bottom, self.rect.width, self.rect.height
+            if l and b and w and h then
+                return cursorX >= l and cursorX <= (l + w) and cursorY >= b and cursorY <= (b + h)
+            end
+            return false
+        end,
+        GetChildren = function(self)
+            local res = {}
+            for _, child in ipairs(mockFrames) do
+                if child.parent == self then
+                    table.insert(res, child)
+                end
+            end
+            return (unpack or table.unpack)(res)
+        end,
+        GetEffectiveScale = function(self)
+            return self.effectiveScale or 1.0
+        end,
     }
     table.insert(mockFrames, f)
     return f
@@ -632,6 +660,266 @@ do
     bTest.scripts["OnMouseUp"](bTest, "LeftButton")
     leftMouseDown = false
     assert_true(bTest:GetAlpha() == 1.0, "Button remains in normal state after normal click")
+end
+
+-- Test 16: Frame Pool Reuse & Drag Re-arming
+do
+    local bPool = CreateFrame("Button", "PooledBtn")
+    local desc = { GetData = function() return 777 end, SetCanSelect = function() end }
+    addonNamespace.SetupLoadoutButton(bPool, desc, nil, 777)
+    assert_true(bPool.registeredDrag ~= nil and bPool.registeredDrag[1] == "LeftButton", "Pooled button registered for drag initially")
+
+    -- Simulate frame pool reset (Blizzard SetToDefaults wipes registeredDrag)
+    bPool.registeredDrag = nil
+    assert_true(bPool.registeredDrag == nil, "Drag registration wiped by pool reset")
+
+    -- Second menu open reuses bPool from pool
+    addonNamespace.SetupLoadoutButton(bPool, desc, nil, 888)
+    assert_true(bPool.registeredDrag ~= nil and bPool.registeredDrag[1] == "LeftButton", "Pooled button re-registers drag on reuse")
+    assert_true(bPool.rtLoadoutConfigID == 888, "Pooled button config ID updated")
+end
+
+-- Test 17: Utility Button (Gear Edit Button) Exclusion
+do
+    local rowBtn = CreateFrame("Button", "RowBtn")
+    rowBtn:SetRect(50, 200, 200, 20)
+    rowBtn.rtLoadoutConfigID = 999
+    local desc = { GetData = function() return 999 end, SetCanSelect = function() end }
+    addonNamespace.SetupLoadoutButton(rowBtn, desc, nil, 999)
+
+    -- Attach a child utility gear button
+    local gearChild = CreateFrame("Button", "GearChildBtn", rowBtn)
+    gearChild.mouseOverOverride = true
+    gearChild:Show()
+
+    -- Try OnDragStart while over gear child
+    addonNamespace.CancelDrag()
+    rowBtn.scripts["OnDragStart"](rowBtn)
+    assert_true(rowBtn:GetAlpha() == 1.0, "Drag start blocked when hovering over gear edit child button")
+
+    -- Try OnMouseDown while over gear child
+    cursorX, cursorY = 100, 100
+    rowBtn.scripts["OnMouseDown"](rowBtn, "LeftButton")
+    local evFrame = nil
+    for _, f in ipairs(mockFrames) do
+        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
+    end
+    cursorX, cursorY = 150, 150
+    leftMouseDown = true
+    evFrame.scripts["OnUpdate"](evFrame, 0.016)
+    assert_true(rowBtn:GetAlpha() == 1.0, "Potential drag blocked when clicking gear child button")
+    leftMouseDown = false
+    addonNamespace.CancelDrag()
+end
+
+-- Test 18: GLOBAL_MOUSE_DOWN Event Detection
+do
+    addonNamespace.ClearActiveButtons()
+    local gBtn = CreateFrame("Button", "GlobalMouseBtn")
+    gBtn:SetRect(50, 200, 200, 20)
+    gBtn.rtLoadoutConfigID = 701
+    gBtn:Show()
+    local desc = { GetData = function() return 701 end, SetCanSelect = function() end }
+    addonNamespace.SetupLoadoutButton(gBtn, desc, nil, 701)
+
+    local evFrame = nil
+    for _, f in ipairs(mockFrames) do
+        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
+    end
+
+    -- Cursor over gBtn
+    cursorX = 100
+    cursorY = 210
+    leftMouseDown = true
+    evFrame.scripts["OnEvent"](evFrame, "GLOBAL_MOUSE_DOWN", "LeftButton")
+
+    -- Move mouse > 5px
+    cursorX = 120
+    cursorY = 210
+    evFrame.scripts["OnUpdate"](evFrame, 0.016)
+
+    assert_true(gBtn:GetAlpha() == 0.35, "GLOBAL_MOUSE_DOWN successfully triggered drag on loadout button")
+    addonNamespace.CancelDrag()
+    assert_true(gBtn:GetAlpha() == 1.0, "Drag cleaned up after GLOBAL_MOUSE_DOWN test")
+    leftMouseDown = false
+end
+
+-- Test 19: Vertical Bounds Drag Cancellation
+do
+    local specID = 250
+    local mockTalentsFrame = PlayerSpellsFrame.TalentsFrame
+    mockTalentsFrame.LoadSystem.possibleSelections = { 101, 102, 103 }
+
+    addonNamespace.ClearActiveButtons()
+    local b1 = CreateFrame("Button", "VB1")
+    b1:SetRect(50, 200, 200, 20) -- top: 220
+    local b2 = CreateFrame("Button", "VB2")
+    b2:SetRect(50, 180, 200, 20)
+    local b3 = CreateFrame("Button", "VB3")
+    b3:SetRect(50, 160, 200, 20) -- bottom: 160
+
+    addonNamespace.SetupLoadoutButton(b1, { GetData = function() return 101 end, SetCanSelect = function() end }, nil, 101)
+    addonNamespace.SetupLoadoutButton(b2, { GetData = function() return 102 end, SetCanSelect = function() end }, nil, 102)
+    addonNamespace.SetupLoadoutButton(b3, { GetData = function() return 103 end, SetCanSelect = function() end }, nil, 103)
+
+    addonNamespace.StartDrag(b3)
+
+    -- Move cursor far above menu (> 60px above 220, e.g. Y = 300)
+    cursorX = 100
+    cursorY = 300
+    addonNamespace.UpdateDrag()
+    addonNamespace.FinishDrag()
+
+    assert_table_eq(mockTalentsFrame.LoadSystem.possibleSelections, { 101, 102, 103 }, "Drop far above menu cancelled, order untouched")
+
+    -- Move cursor far below menu (> 60px below 160, e.g. Y = 80)
+    addonNamespace.StartDrag(b1)
+    cursorX = 100
+    cursorY = 80
+    addonNamespace.UpdateDrag()
+    addonNamespace.FinishDrag()
+
+    assert_table_eq(mockTalentsFrame.LoadSystem.possibleSelections, { 101, 102, 103 }, "Drop far below menu cancelled, order untouched")
+end
+
+-- Test 20: Menu Release / Close Callback via AddMenuReleasedCallback
+do
+    local specID = 250
+    local mockTalentsFrame = PlayerSpellsFrame.TalentsFrame
+    local bClose = CreateFrame("Button", "CloseTestBtn")
+    bClose:SetRect(50, 200, 200, 20)
+    bClose.rtLoadoutConfigID = 101
+
+    addonNamespace.ClearActiveButtons()
+    addonNamespace.SetupLoadoutButton(bClose, { GetData = function() return 101 end, SetCanSelect = function() end }, nil, 101)
+
+    -- Start drag
+    addonNamespace.StartDrag(bClose)
+    assert_true(bClose:GetAlpha() == 0.35, "Drag started before menu release")
+
+    -- Simulate menu release callback
+    local releasedCallback = nil
+    local mockRootDesc = {
+        EnumerateElementDescriptions = function(self)
+            return coroutine.wrap(function() end)
+        end,
+        AddMenuReleasedCallback = function(self, cb)
+            releasedCallback = cb
+        end,
+    }
+
+    if Menu and Menu.callbacks and Menu.callbacks["MENU_CLASS_TALENT_PROFILE"] then
+        Menu.callbacks["MENU_CLASS_TALENT_PROFILE"](nil, mockRootDesc, nil)
+    end
+
+    assert_true(releasedCallback ~= nil, "AddMenuReleasedCallback registered on menu description")
+    releasedCallback()
+
+    assert_true(bClose:GetAlpha() == 1.0, "Menu release cancelled drag and restored button alpha")
+end
+
+-- Test 21: Purge Deleted Loadouts from Saved Database
+do
+    local pKey = addonNamespace.GetPlayerKey()
+    local specID = 300
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = {
+        order = { 201, 202, 203 },
+        names = { [201] = "Old1", [202] = "DeletedLoadout", [203] = "Old3" },
+    }
+
+    -- In-game config IDs now only have 201 and 203 (202 was deleted)
+    local currentIDs = { 201, 203 }
+    local names = { [201] = "Old1", [203] = "Old3" }
+
+    local sorted = addonNamespace.SortConfigIDs(specID, currentIDs, names)
+    assert_table_eq(sorted, { 201, 203 }, "Sorted IDs excluded deleted 202")
+
+    local savedInDB = addonNamespace.GetSavedOrder(pKey, specID)
+    assert_table_eq(savedInDB.order, { 201, 203 }, "Saved order in DB was purged of deleted loadout 202")
+    assert_true(savedInDB.names[202] == nil, "Deleted loadout name removed from DB")
+end
+
+-- Test 22: GUID and Name-Realm Fallback in GetSavedOrder
+do
+    local specID = 400
+    local realmKey = mockPlayerName .. "-" .. mockRealmName
+    ReorderTalentLoadoutsDB[realmKey] = {
+        [specID] = { order = { 301, 302 }, names = {} }
+    }
+
+    -- Query using a different key format, should resolve via fallback
+    local found = addonNamespace.GetSavedOrder("DifferentGuidKey", specID)
+    assert_true(found ~= nil, "GetSavedOrder resolved order via Name-Realm fallback")
+    assert_table_eq(found.order, { 301, 302 }, "Order matches expected fallback data")
+end
+
+-- Test 23: Sound Suppression During Drag & Drop
+do
+    local capturedSoundFunc = nil
+    local mockDesc = {
+        GetData = function() return 999 end,
+        SetCanSelect = function() end,
+        GetSoundKit = function() return 856 end,
+        SetSoundKit = function(self, fn) capturedSoundFunc = fn end,
+        AddInitializer = function() end,
+    }
+    local mockRoot = {
+        EnumerateElementDescriptions = function()
+            local list = { mockDesc }
+            local i = 0
+            return function()
+                i = i + 1
+                if not list[i] then return nil end
+                return i, list[i]
+            end
+        end,
+    }
+
+    if Menu and Menu.callbacks and Menu.callbacks["MENU_CLASS_TALENT_PROFILE"] then
+        PlayerSpellsFrame.TalentsFrame.LoadSystem.possibleSelections = { 999 }
+        Menu.callbacks["MENU_CLASS_TALENT_PROFILE"](nil, mockRoot, nil)
+    end
+
+    assert_true(capturedSoundFunc ~= nil, "SetSoundKit wrapper was installed")
+    -- When dragging: returns 0 (silent)
+    local bSound = CreateFrame("Button", "SoundTestBtn")
+    bSound.rtLoadoutConfigID = 999
+    addonNamespace.StartDrag(bSound)
+    assert_true(capturedSoundFunc(mockDesc) == 0, "Sound suppressed (0) while isDragging is true")
+    addonNamespace.CancelDrag()
+
+    -- Normal state: returns original sound kit
+    assert_true(capturedSoundFunc(mockDesc) == 856, "Normal sound returned when not dragging")
+end
+
+-- Test 24: Drop Calls GenerateMenu Seamlessly
+do
+    local specID = 250
+    local mockTalentsFrame = PlayerSpellsFrame.TalentsFrame
+    mockTalentsFrame.LoadSystem.possibleSelections = { 101, 102 }
+
+    local generateMenuCalled = false
+    mockTalentsFrame.LoadSystem.dropdown.GenerateMenu = function(self)
+        generateMenuCalled = true
+    end
+
+    addonNamespace.ClearActiveButtons()
+    local b1 = CreateFrame("Button", "GenB1")
+    b1:SetRect(50, 200, 200, 20)
+    local b2 = CreateFrame("Button", "GenB2")
+    b2:SetRect(50, 180, 200, 20)
+
+    addonNamespace.SetupLoadoutButton(b1, { GetData = function() return 101 end, SetCanSelect = function() end }, nil, 101)
+    addonNamespace.SetupLoadoutButton(b2, { GetData = function() return 102 end, SetCanSelect = function() end }, nil, 102)
+
+    addonNamespace.StartDrag(b2)
+    cursorX = 100
+    cursorY = 215 -- Move 102 to top
+    addonNamespace.UpdateDrag()
+    addonNamespace.FinishDrag()
+
+    assert_true(generateMenuCalled, "GenerateMenu was called seamlessly on drop")
 end
 
 print(string.format("\nTest Results: %d Passed, %d Failed", passed, failed))
