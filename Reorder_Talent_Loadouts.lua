@@ -344,40 +344,18 @@ local insertionLine = nil;
 local function CreateUIElements()
     if insertionLine then return end
 
-    -- Insertion Indicator Line
+    -- Insertion Indicator Line: a plain bar in the loadout-name text color (yellowish),
+    -- matching Blizzard's NORMAL_FONT_COLOR used for dropdown loadout entries.
     insertionLine = CreateFrame("Frame", "ReorderTalentLoadoutsInsertionLine", UIParent);
-    insertionLine:SetHeight(3);
+    insertionLine:SetHeight(2);
     insertionLine:SetFrameStrata("TOOLTIP");
     insertionLine:SetFrameLevel(9998);
     insertionLine:EnableMouse(false);
 
-    -- Glowing bar texture behind the line
-    local glow = insertionLine:CreateTexture(nil, "BACKGROUND");
-    glow:SetHeight(7);
-    glow:SetPoint("LEFT", -4, 0);
-    glow:SetPoint("RIGHT", 4, 0);
-    glow:SetPoint("CENTER", 0, 0);
-    glow:SetColorTexture(0.1, 0.55, 1.0, 0.45);
-    insertionLine.glow = glow;
-
-    -- Sharp center line
     local lineTex = insertionLine:CreateTexture(nil, "ARTWORK");
-    lineTex:SetHeight(3);
     lineTex:SetAllPoints();
-    lineTex:SetColorTexture(0.2, 0.8, 1.0, 1.0);
+    lineTex:SetColorTexture(1.0, 0.82, 0.0, 1.0);
     insertionLine.lineTex = lineTex;
-
-    -- Left indicator arrow
-    local leftArrow = insertionLine:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall");
-    leftArrow:SetPoint("RIGHT", insertionLine, "LEFT", -1, 0);
-    leftArrow:SetText("▶");
-    leftArrow:SetTextColor(0.2, 0.8, 1.0, 1.0);
-
-    -- Right indicator arrow
-    local rightArrow = insertionLine:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall");
-    rightArrow:SetPoint("LEFT", insertionLine, "RIGHT", 1, 0);
-    rightArrow:SetText("◀");
-    rightArrow:SetTextColor(0.2, 0.8, 1.0, 1.0);
 
     insertionLine:Hide();
 end
