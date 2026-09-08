@@ -1082,14 +1082,15 @@ do
     mockTalentsFrame.configIDToName = {}
 end
 
--- Test 29: TOC Interface Version Includes 120100 (Patch 12.1)
+-- Test 29: TOC Interface Version Specifies 120100 Only (Patch 12.1)
 do
     local f = io.open("Reorder_Talent_Loadouts.toc", "r")
     assert_true(f ~= nil, "TOC file exists and is readable")
     local content = f:read("*all")
     f:close()
-    assert_true(content:find("120100") ~= nil, "TOC specifies Interface 120100 for Patch 12.1")
-    assert_true(content:find("120000") ~= nil, "TOC specifies Interface 120000 for Patch 12.0")
+    assert_true(content:find("## Interface: 120100") ~= nil, "TOC specifies Interface: 120100 for Patch 12.1 only")
+    assert_true(content:find("120000") == nil, "TOC does not include older 120000")
+    assert_true(content:find("110007") == nil, "TOC does not include older 110007")
 end
 
 -- Test 30: Full drag & drop lifecycle without global frames (ownerRegion resolved)
@@ -1274,6 +1275,59 @@ do
     assert_true(inputUtilCalled, "ns.UpdateDrag invoked InputUtil.GetCursorPosition(UIParent)")
     addonNamespace.CancelDrag()
     InputUtil = nil
+end
+
+-- Test 35: talentsFrame.configIDs is NEVER mutated or tainted
+do
+    local pKey = addonNamespace.GetPlayerKey()
+    local specID = 250
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 202, 201 } }
+
+    local talentsFrame = PlayerSpellsFrame.TalentsFrame
+    local originalConfigIDs = { 201, 202 }
+    talentsFrame.configIDs = originalConfigIDs
+    talentsFrame.LoadSystem.possibleSelections = { 201, 202 }
+
+    addonNamespace.OnRefreshLoadoutOptions(talentsFrame)
+
+    assert_true(talentsFrame.configIDs == originalConfigIDs, "talentsFrame.configIDs table reference is untouched")
+    assert_table_eq(talentsFrame.configIDs, { 201, 202 }, "talentsFrame.configIDs elements are never modified by addon")
+    assert_table_eq(talentsFrame.LoadSystem.possibleSelections, { 202, 201 }, "LoadSystem.possibleSelections is properly sorted")
+end
+
+-- Test 36: loadSystem.possibleSelections is sorted in-place (table identity preserved)
+do
+    local pKey = addonNamespace.GetPlayerKey()
+    local specID = 250
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 303, 302, 301 } }
+
+    local talentsFrame = PlayerSpellsFrame.TalentsFrame
+    local selectionsTable = { 301, 302, 303 }
+    talentsFrame.LoadSystem.possibleSelections = selectionsTable
+
+    addonNamespace.OnRefreshLoadoutOptions(talentsFrame)
+
+    assert_true(talentsFrame.LoadSystem.possibleSelections == selectionsTable, "possibleSelections table identity is preserved via in-place mutation")
+    assert_table_eq(talentsFrame.LoadSystem.possibleSelections, { 303, 302, 301 }, "possibleSelections content sorted in-place")
+end
+
+-- Test 37: loadSystem:UpdateSelectionOptions is NEVER called during sort or drag
+do
+    local updateSelectionOptionsCalled = false
+    local talentsFrame = PlayerSpellsFrame.TalentsFrame
+    talentsFrame.LoadSystem.UpdateSelectionOptions = function()
+        updateSelectionOptionsCalled = true
+    end
+
+    local pKey = addonNamespace.GetPlayerKey()
+    local specID = 250
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 402, 401 } }
+    talentsFrame.LoadSystem.possibleSelections = { 401, 402 }
+
+    addonNamespace.OnRefreshLoadoutOptions(talentsFrame)
+
+    assert_true(not updateSelectionOptionsCalled, "UpdateSelectionOptions was NOT called (Blizzard untainted generator preserved)")
 end
 
 print(string.format("\nTest Results: %d Passed, %d Failed", passed, failed))

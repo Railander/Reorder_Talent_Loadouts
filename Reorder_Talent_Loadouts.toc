@@ -1,4 +1,4 @@
-## Interface: 110007, 110100, 110200, 120000, 120001, 120005, 120007, 120100, 120105
+## Interface: 120100
 ## Title: Reorder Talent Loadouts
 ## Notes: Reorder talent loadouts by simply click-and-holding and moving them in the loadout dropdown.
 ## Author: Railander

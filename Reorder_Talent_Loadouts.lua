@@ -50,6 +50,16 @@ function ns.ArraysEqual(a, b)
     return true;
 end
 
+function ns.SortInPlace(tbl, sorted)
+    if not tbl or not sorted then return end
+    for i = 1, #sorted do
+        tbl[i] = sorted[i];
+    end
+    for i = #sorted + 1, #tbl do
+        tbl[i] = nil;
+    end
+end
+
 -- ----------------------------------------------------------------------------
 -- Database & Order Management
 -- ----------------------------------------------------------------------------
@@ -201,11 +211,15 @@ local cachedTalentsFrame = nil;
 local cachedLoadSystem = nil;
 
 function ns.GetSpecID(talentsFrame)
+    if PlayerUtil and PlayerUtil.GetCurrentSpecID then
+        local specID = PlayerUtil.GetCurrentSpecID();
+        if specID then
+            return specID;
+        end
+    end
     local specID = talentsFrame and talentsFrame.GetSpecID and talentsFrame:GetSpecID();
     if not specID then
-        if PlayerUtil and PlayerUtil.GetCurrentSpecID then
-            specID = PlayerUtil.GetCurrentSpecID();
-        elseif C_SpecializationInfo and C_SpecializationInfo.GetSpecialization and C_SpecializationInfo.GetSpecializationInfo then
+        if C_SpecializationInfo and C_SpecializationInfo.GetSpecialization and C_SpecializationInfo.GetSpecializationInfo then
             local curSpec = C_SpecializationInfo.GetSpecialization();
             if curSpec then
                 specID = C_SpecializationInfo.GetSpecializationInfo(curSpec);
@@ -565,11 +579,10 @@ function ns.FinishDrag()
         ns.SaveOrder(playerKey, specID, newList, configIDToName);
     end
 
-    -- Update loadSystem selections and talentsFrame cache
-    loadSystem.possibleSelections = CopyTable(newList);
-    if talentsFrame.configIDs then
-        talentsFrame.configIDs = CopyTable(newList);
-    end
+    -- Update loadSystem selections in place without touching talentsFrame.configIDs
+    -- IMPORTANT (WoW 12.1+): We must NEVER mutate talentsFrame.configIDs as that taints ClassTalentsFrame,
+    -- causing C_ClassTalents.GetConfigIDsBySpecID to fail with SecretArguments AllowedWhenUntainted.
+    ns.SortInPlace(loadSystem.possibleSelections, newList);
 
     -- Play a satisfying sound
     if PlaySound and SOUNDKIT and SOUNDKIT.IG_MAINMENU_OPTION_CHECKBOX_ON then
@@ -577,11 +590,11 @@ function ns.FinishDrag()
     end
 
     -- Seamlessly refresh the dropdown to display the new order immediately
+    -- We use Blizzard's untainted menu generator via dropdown:GenerateMenu().
+    -- NEVER call loadSystem:UpdateSelectionOptions() as that creates an addon closure in SetupMenu!
     local dropdown = loadSystem.GetDropdown and loadSystem:GetDropdown();
     if dropdown and dropdown.GenerateMenu then
         dropdown:GenerateMenu();
-    elseif loadSystem.UpdateSelectionOptions then
-        loadSystem:UpdateSelectionOptions();
     elseif dropdown and dropdown.CloseMenu and dropdown.OpenMenu then
         dropdown:CloseMenu();
         dropdown:OpenMenu();
@@ -800,11 +813,11 @@ local function OnRefreshLoadoutOptions(talentsFrame)
     local configIDToName = ns.GetConfigIDToName(talentsFrame, currentSelections);
     local sorted = ns.SortConfigIDs(specID, currentSelections, configIDToName);
     if not ns.ArraysEqual(currentSelections, sorted) then
-        loadSystem.possibleSelections = CopyTable(sorted);
-        if talentsFrame.configIDs then
-            talentsFrame.configIDs = CopyTable(sorted);
+        ns.SortInPlace(loadSystem.possibleSelections, sorted);
+        local dropdown = loadSystem.GetDropdown and loadSystem:GetDropdown();
+        if dropdown and dropdown.IsMenuOpen and dropdown:IsMenuOpen() and dropdown.GenerateMenu then
+            dropdown:GenerateMenu();
         end
-        loadSystem:UpdateSelectionOptions();
     end
 end
 
@@ -819,8 +832,11 @@ local function OnSetSelectionOptions(loadSystem, possibleSelections)
     local configIDToName = ns.GetConfigIDToName(talentsFrame, loadSystem.possibleSelections);
     local sorted = ns.SortConfigIDs(specID, loadSystem.possibleSelections, configIDToName);
     if not ns.ArraysEqual(loadSystem.possibleSelections, sorted) then
-        loadSystem.possibleSelections = CopyTable(sorted);
-        loadSystem:UpdateSelectionOptions();
+        ns.SortInPlace(loadSystem.possibleSelections, sorted);
+        local dropdown = loadSystem.GetDropdown and loadSystem:GetDropdown();
+        if dropdown and dropdown.IsMenuOpen and dropdown:IsMenuOpen() and dropdown.GenerateMenu then
+            dropdown:GenerateMenu();
+        end
     end
 end
 
@@ -837,11 +853,6 @@ InitializeTalentHooks = function()
         hooksecurefunc(talentsFrame.LoadSystem, "SetSelectionOptions", OnSetSelectionOptions);
     end
 
-    -- Hook Hide to cancel any active drag if the window is closed
-    if talentsFrame.HookScript then
-        talentsFrame:HookScript("OnHide", ns.CancelDrag);
-    end
-
     -- Hook Dropdown menu close callback to cancel any active drag
     local loadSystem = talentsFrame.LoadSystem;
     local dropdown = loadSystem.GetDropdown and loadSystem:GetDropdown();
@@ -854,7 +865,9 @@ InitializeTalentHooks = function()
     end
 
     -- Apply initial sort if options already exist
-    OnRefreshLoadoutOptions(talentsFrame);
+    if loadSystem and loadSystem.possibleSelections and #loadSystem.possibleSelections > 1 then
+        OnRefreshLoadoutOptions(talentsFrame);
+    end
 end
 
 ns.InitializeTalentHooks = InitializeTalentHooks;
@@ -971,6 +984,11 @@ SlashCmdList["REORDERTALENTLOADOUTS"] = function(msg)
             end
             if talentsFrame and talentsFrame.RefreshLoadoutOptions then
                 talentsFrame:RefreshLoadoutOptions();
+            end
+            local loadSystem = talentsFrame and talentsFrame.LoadSystem;
+            local dropdown = loadSystem and loadSystem.GetDropdown and loadSystem:GetDropdown();
+            if dropdown and dropdown.IsMenuOpen and dropdown:IsMenuOpen() and dropdown.GenerateMenu then
+                dropdown:GenerateMenu();
             end
             if DEFAULT_CHAT_FRAME then
                 DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffReorder Talent Loadouts:|r Loadout order reset to default for this spec.");
