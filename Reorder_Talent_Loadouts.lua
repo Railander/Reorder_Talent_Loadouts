@@ -194,10 +194,49 @@ function ns.CalculateNewOrder(list, fromIndex, targetIndex)
 end
 
 -- ----------------------------------------------------------------------------
--- Talent Frame Detection
+-- Talent Frame Detection & Helpers
 -- ----------------------------------------------------------------------------
 
-local function GetTalentsFrame()
+local cachedTalentsFrame = nil;
+local cachedLoadSystem = nil;
+
+function ns.GetSpecID(talentsFrame)
+    local specID = talentsFrame and talentsFrame.GetSpecID and talentsFrame:GetSpecID();
+    if not specID then
+        if PlayerUtil and PlayerUtil.GetCurrentSpecID then
+            specID = PlayerUtil.GetCurrentSpecID();
+        elseif C_SpecializationInfo and C_SpecializationInfo.GetSpecialization and C_SpecializationInfo.GetSpecializationInfo then
+            local curSpec = C_SpecializationInfo.GetSpecialization();
+            if curSpec then
+                specID = C_SpecializationInfo.GetSpecializationInfo(curSpec);
+            end
+        elseif GetSpecialization and GetSpecializationInfo then
+            local curSpec = GetSpecialization();
+            if curSpec then
+                specID = GetSpecializationInfo(curSpec);
+            end
+        end
+    end
+    return specID;
+end
+
+function ns.GetConfigIDToName(talentsFrame, configIDs)
+    if talentsFrame and talentsFrame.configIDToName then
+        return talentsFrame.configIDToName;
+    end
+    local map = {};
+    if configIDs and C_Traits and C_Traits.GetConfigInfo then
+        for _, id in ipairs(configIDs) do
+            local info = C_Traits.GetConfigInfo(id);
+            if info and info.name then
+                map[id] = info.name;
+            end
+        end
+    end
+    return map;
+end
+
+local function GetTalentsFrame(ownerRegion, useCache)
     if PlayerSpellsFrame and PlayerSpellsFrame.TalentsFrame then
         return PlayerSpellsFrame.TalentsFrame;
     elseif ClassTalentFrame then
@@ -207,13 +246,34 @@ local function GetTalentsFrame()
             return ClassTalentFrame;
         end
     end
+    if ownerRegion and ownerRegion.GetParent then
+        local parent = ownerRegion:GetParent();
+        if parent and parent.possibleSelections and (parent.GetDropdown or parent.Dropdown) then
+            local grandParent = parent:GetParent();
+            if grandParent and (grandParent.configIDs or grandParent.RefreshLoadoutOptions) then
+                return grandParent;
+            end
+        end
+    end
+    if useCache then
+        return cachedTalentsFrame;
+    end
     return nil;
 end
 
-local function GetLoadSystem()
-    local talentsFrame = GetTalentsFrame();
+local function GetLoadSystem(ownerRegion, useCache)
+    local talentsFrame = GetTalentsFrame(ownerRegion, useCache);
     if talentsFrame and talentsFrame.LoadSystem then
         return talentsFrame.LoadSystem;
+    end
+    if ownerRegion and ownerRegion.GetParent then
+        local parent = ownerRegion:GetParent();
+        if parent and parent.possibleSelections and (parent.GetDropdown or parent.Dropdown) then
+            return parent;
+        end
+    end
+    if useCache then
+        return cachedLoadSystem;
     end
     return nil;
 end
@@ -326,16 +386,18 @@ function ns.StartDrag(button)
     button:SetAlpha(0.35);
 
     -- Set drag thumbnail text and icon
-    local talentsFrame = GetTalentsFrame();
-    local loadoutName = "Loadout";
-    if talentsFrame and talentsFrame.configIDToName and talentsFrame.configIDToName[dragSourceConfigID] then
-        loadoutName = talentsFrame.configIDToName[dragSourceConfigID];
-    elseif button.fontString and button.fontString.GetText then
-        local btnText = button.fontString:GetText();
-        if btnText and btnText ~= "" then
-            loadoutName = btnText;
+    local talentsFrame = GetTalentsFrame(button, true);
+    local configIDToName = ns.GetConfigIDToName(talentsFrame, { dragSourceConfigID });
+    local loadoutName = configIDToName[dragSourceConfigID];
+    if not loadoutName or loadoutName == "" then
+        if button.fontString and button.fontString.GetText then
+            local btnText = button.fontString:GetText();
+            if btnText and btnText ~= "" then
+                loadoutName = btnText;
+            end
         end
     end
+    loadoutName = loadoutName or "Loadout";
 
     dragPreviewFrame.label:SetText(loadoutName);
     dragPreviewFrame:Show();
@@ -346,10 +408,15 @@ end
 function ns.UpdateDrag()
     if not isDragging then return end
 
-    local curX, curY = GetCursorPosition();
-    local scale = UIParent and UIParent:GetEffectiveScale() or 1;
-    local cursorX = curX / scale;
-    local cursorY = curY / scale;
+    local cursorX, cursorY;
+    if InputUtil and InputUtil.GetCursorPosition and UIParent then
+        cursorX, cursorY = InputUtil.GetCursorPosition(UIParent);
+    else
+        local curX, curY = GetCursorPosition();
+        local scale = UIParent and UIParent:GetEffectiveScale() or 1;
+        cursorX = curX / scale;
+        cursorY = curY / scale;
+    end
 
     -- Position the floating preview frame near the cursor
     if dragPreviewFrame then
@@ -450,8 +517,8 @@ function ns.FinishDrag()
         return;
     end
 
-    local talentsFrame = GetTalentsFrame();
-    local loadSystem = GetLoadSystem();
+    local talentsFrame = GetTalentsFrame(dragSourceButton, true);
+    local loadSystem = GetLoadSystem(dragSourceButton, true);
     if not talentsFrame or not loadSystem then
         dragSourceButton = nil;
         dragSourceConfigID = nil;
@@ -490,10 +557,12 @@ function ns.FinishDrag()
     end
 
     -- Persist the new order
-    local specID = talentsFrame.GetSpecID and talentsFrame:GetSpecID();
+    local specID = ns.GetSpecID(talentsFrame);
+    local configIDToName = ns.GetConfigIDToName(talentsFrame, newList);
+
     local playerKey = ns.GetPlayerKey();
     if playerKey and specID then
-        ns.SaveOrder(playerKey, specID, newList, talentsFrame.configIDToName);
+        ns.SaveOrder(playerKey, specID, newList, configIDToName);
     end
 
     -- Update loadSystem selections and talentsFrame cache
@@ -630,12 +699,25 @@ function ns.SetupLoadoutButton(button, description, menu, configID)
     end
 end
 
-local function OnModifyTalentMenu(ownerRegion, rootDescription, contextData)
-    local talentsFrame = GetTalentsFrame();
-    if not talentsFrame or not talentsFrame.LoadSystem then return end
-    if talentsFrame.IsInspecting and talentsFrame:IsInspecting() then return end
+local InitializeTalentHooks;
 
-    local loadSystem = talentsFrame.LoadSystem;
+local function OnModifyTalentMenu(ownerRegion, rootDescription, contextData)
+    local talentsFrame = GetTalentsFrame(ownerRegion);
+    local loadSystem = (talentsFrame and talentsFrame.LoadSystem) or GetLoadSystem(ownerRegion);
+    if not loadSystem then return end
+    if talentsFrame and talentsFrame.IsInspecting and talentsFrame:IsInspecting() then return end
+
+    if talentsFrame then
+        cachedTalentsFrame = talentsFrame;
+    end
+    if loadSystem then
+        cachedLoadSystem = loadSystem;
+    end
+
+    if InitializeTalentHooks then
+        InitializeTalentHooks();
+    end
+
     local possibleSelections = loadSystem.possibleSelections or {};
     local selectionSet = {};
     for _, id in ipairs(possibleSelections) do
@@ -650,6 +732,8 @@ local function OnModifyTalentMenu(ownerRegion, rootDescription, contextData)
         rootDescription:AddMenuReleasedCallback(function()
             ns.CancelDrag();
             ns.ClearActiveButtons();
+            cachedTalentsFrame = nil;
+            cachedLoadSystem = nil;
         end);
     end
 
@@ -667,7 +751,14 @@ local function OnModifyTalentMenu(ownerRegion, rootDescription, contextData)
             end);
 
             -- Suppress click sound when dragging or immediately after dropping
-            local origSoundKit = desc.GetSoundKit and desc:GetSoundKit();
+            -- Note: In WoW 12.1+, desc:GetSoundKit() raises an error if soundKit is nil, so wrap in pcall
+            local origSoundKit = nil;
+            if desc.GetSoundKit then
+                local ok, sk = pcall(desc.GetSoundKit, desc);
+                if ok then
+                    origSoundKit = sk;
+                end
+            end
             desc:SetSoundKit(function(elementDesc)
                 if isDragging or justFinishedDragging then
                     return 0;
@@ -699,14 +790,15 @@ local function OnRefreshLoadoutOptions(talentsFrame)
     if talentsFrame.IsInspecting and talentsFrame:IsInspecting() then return end
     if InCombatLockdown and InCombatLockdown() then return end
 
-    local specID = talentsFrame.GetSpecID and talentsFrame:GetSpecID();
+    local specID = ns.GetSpecID(talentsFrame);
     if not specID then return end
 
     local loadSystem = talentsFrame.LoadSystem;
     local currentSelections = loadSystem.possibleSelections;
     if not currentSelections or #currentSelections <= 1 then return end
 
-    local sorted = ns.SortConfigIDs(specID, currentSelections, talentsFrame.configIDToName);
+    local configIDToName = ns.GetConfigIDToName(talentsFrame, currentSelections);
+    local sorted = ns.SortConfigIDs(specID, currentSelections, configIDToName);
     if not ns.ArraysEqual(currentSelections, sorted) then
         loadSystem.possibleSelections = CopyTable(sorted);
         if talentsFrame.configIDs then
@@ -721,17 +813,18 @@ local function OnSetSelectionOptions(loadSystem, possibleSelections)
     if not talentsFrame or (talentsFrame.IsInspecting and talentsFrame:IsInspecting()) then return end
     if InCombatLockdown and InCombatLockdown() then return end
 
-    local specID = talentsFrame.GetSpecID and talentsFrame:GetSpecID();
+    local specID = ns.GetSpecID(talentsFrame);
     if not specID or not loadSystem.possibleSelections or #loadSystem.possibleSelections <= 1 then return end
 
-    local sorted = ns.SortConfigIDs(specID, loadSystem.possibleSelections, talentsFrame.configIDToName);
+    local configIDToName = ns.GetConfigIDToName(talentsFrame, loadSystem.possibleSelections);
+    local sorted = ns.SortConfigIDs(specID, loadSystem.possibleSelections, configIDToName);
     if not ns.ArraysEqual(loadSystem.possibleSelections, sorted) then
         loadSystem.possibleSelections = CopyTable(sorted);
         loadSystem:UpdateSelectionOptions();
     end
 end
 
-local function InitializeTalentHooks()
+InitializeTalentHooks = function()
     if hooksInstalled then return end
 
     local talentsFrame = GetTalentsFrame();
@@ -764,9 +857,21 @@ local function InitializeTalentHooks()
     OnRefreshLoadoutOptions(talentsFrame);
 end
 
+ns.InitializeTalentHooks = InitializeTalentHooks;
+ns.OnRefreshLoadoutOptions = OnRefreshLoadoutOptions;
+
 -- ----------------------------------------------------------------------------
 -- Core Event Controller Frame
 -- ----------------------------------------------------------------------------
+
+local function IsAddOnLoadedSafe(addonName)
+    if C_AddOns and C_AddOns.IsAddOnLoaded then
+        return C_AddOns.IsAddOnLoaded(addonName);
+    elseif IsAddOnLoaded then
+        return IsAddOnLoaded(addonName);
+    end
+    return false;
+end
 
 local eventFrame = CreateFrame("Frame", "ReorderTalentLoadoutsEventFrame");
 eventFrame:RegisterEvent("ADDON_LOADED");
@@ -779,7 +884,7 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
             ReorderTalentLoadoutsDB = ReorderTalentLoadoutsDB or {};
-            if C_AddOns and (C_AddOns.IsAddOnLoaded("Blizzard_PlayerSpells") or C_AddOns.IsAddOnLoaded("Blizzard_ClassTalentUI")) then
+            if IsAddOnLoadedSafe("Blizzard_PlayerSpells") or IsAddOnLoadedSafe("Blizzard_ClassTalentUI") then
                 InitializeTalentHooks();
             end
         elseif arg1 == "Blizzard_PlayerSpells" or arg1 == "Blizzard_ClassTalentUI" then
@@ -787,7 +892,7 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         end
     elseif event == "PLAYER_LOGIN" then
         ReorderTalentLoadoutsDB = ReorderTalentLoadoutsDB or {};
-        if C_AddOns and (C_AddOns.IsAddOnLoaded("Blizzard_PlayerSpells") or C_AddOns.IsAddOnLoaded("Blizzard_ClassTalentUI")) then
+        if IsAddOnLoadedSafe("Blizzard_PlayerSpells") or IsAddOnLoadedSafe("Blizzard_ClassTalentUI") then
             InitializeTalentHooks();
         end
     elseif event == "PLAYER_REGEN_DISABLED" then
@@ -858,10 +963,12 @@ SlashCmdList["REORDERTALENTLOADOUTS"] = function(msg)
     local cmd = msg and string.lower(string.trim(msg)) or "";
     if cmd == "reset" then
         local talentsFrame = GetTalentsFrame();
-        local specID = talentsFrame and talentsFrame.GetSpecID and talentsFrame:GetSpecID();
+        local specID = ns.GetSpecID(talentsFrame);
         local playerKey = ns.GetPlayerKey();
-        if playerKey and specID and ReorderTalentLoadoutsDB[playerKey] then
-            ReorderTalentLoadoutsDB[playerKey][specID] = nil;
+        if playerKey and specID then
+            if ReorderTalentLoadoutsDB[playerKey] then
+                ReorderTalentLoadoutsDB[playerKey][specID] = nil;
+            end
             if talentsFrame and talentsFrame.RefreshLoadoutOptions then
                 talentsFrame:RefreshLoadoutOptions();
             end

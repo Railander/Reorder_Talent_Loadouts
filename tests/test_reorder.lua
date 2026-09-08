@@ -99,6 +99,22 @@ function PlaySound(id)
     table.insert(playedSounds, id);
 end
 
+function hooksecurefunc(tbl, method, hook)
+    if type(tbl) == "string" then
+        local orig = _G[tbl]
+        _G[tbl] = function(...)
+            if orig then orig(...) end
+            return hook(...)
+        end
+    elseif type(tbl) == "table" and type(method) == "string" then
+        local orig = tbl[method]
+        tbl[method] = function(...)
+            if orig then orig(...) end
+            return hook(...)
+        end
+    end
+end
+
 -- Mock Frames
 local mockFrames = {};
 function CreateFrame(frameType, name, parent, template)
@@ -437,6 +453,7 @@ do
         IsInspecting = function() return false end,
         configIDToName = { [101] = "Raid", [102] = "M+", [103] = "PvP" },
         configIDs = { 101, 102, 103 },
+        RefreshLoadoutOptions = function(self) end,
         LoadSystem = {
             possibleSelections = { 101, 102, 103 },
             dropdown = {
@@ -446,6 +463,7 @@ do
             },
             GetDropdown = function(self) return self.dropdown end,
             UpdateSelectionOptions = function(self) end,
+            SetSelectionOptions = function(self, options) end,
         },
     }
     PlayerSpellsFrame = { TalentsFrame = mockTalentsFrame }
@@ -922,10 +940,347 @@ do
     assert_true(generateMenuCalled, "GenerateMenu was called seamlessly on drop")
 end
 
+-- Test 25: WoW 12.1 Menu GetSoundKit nil-call protection (pcall)
+do
+    local capturedSoundFunc = nil
+    local mockDesc = {
+        GetData = function() return 888 end,
+        SetCanSelect = function() end,
+        -- Simulate WoW 12.1 MenuElementDescriptionProxyMixin:GetSoundKit() bug where soundKit is nil
+        GetSoundKit = function(self)
+            error("attempt to call field 'soundKit' (a nil value)")
+        end,
+        SetSoundKit = function(self, fn)
+            capturedSoundFunc = fn
+        end,
+        AddInitializer = function() end,
+    }
+
+    local mockRoot = {
+        EnumerateElementDescriptions = function()
+            local elements = { mockDesc }
+            local i = 0
+            return function()
+                i = i + 1
+                if elements[i] then
+                    return i, elements[i]
+                end
+                return nil
+            end
+        end,
+    }
+
+    PlayerSpellsFrame.TalentsFrame.LoadSystem.possibleSelections = { 888 }
+    -- Must not raise error even though desc:GetSoundKit() threw an error
+    local ok, err = pcall(function()
+        Menu.callbacks["MENU_CLASS_TALENT_PROFILE"](nil, mockRoot, nil)
+    end)
+
+    assert_true(ok, "Menu initialization does not crash when desc:GetSoundKit() throws in 12.1")
+    assert_true(capturedSoundFunc ~= nil, "SetSoundKit wrapper successfully installed despite 12.1 nil error")
+    -- Normal click returns default fallback (SOUNDKIT.U_CHAT_SCROLL_BUTTON = 857)
+    assert_true(capturedSoundFunc(mockDesc) == 857, "Fallback sound returned cleanly on normal click")
+end
+
+-- Test 26: WoW 12.1 /rtl reset with C_SpecializationInfo fallback
+do
+    local pKey = addonNamespace.GetPlayerKey()
+    local specID = 252 -- Unholy DK
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 20, 10 } }
+
+    -- Temporarily disable PlayerSpellsFrame to simulate closed/unloaded talent frame
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = nil
+
+    -- Mock C_SpecializationInfo (12.1 standard API)
+    C_SpecializationInfo = {
+        GetSpecialization = function() return 3 end,
+        GetSpecializationInfo = function(idx)
+            if idx == 3 then return specID end
+            return nil
+        end,
+    }
+
+    SlashCmdList["REORDERTALENTLOADOUTS"]("reset")
+
+    assert_true(ReorderTalentLoadoutsDB[pKey][specID] == nil, "/rtl reset used C_SpecializationInfo fallback when talent window is closed")
+
+    -- Restore
+    PlayerSpellsFrame = savedPSF
+    C_SpecializationInfo = nil
+end
+
+-- Test 27: WoW 12.1 GetTalentsFrame fallback via ownerRegion hierarchy
+do
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = nil
+
+    local mockTalentParent = {
+        configIDs = { 11, 22 },
+        RefreshLoadoutOptions = function() end,
+    }
+    local mockLoadSys = {
+        possibleSelections = { 11, 22 },
+        parent = mockTalentParent,
+        GetParent = function(self) return self.parent end,
+        GetDropdown = function(self) return self.dropdown end,
+    }
+    local mockOwnerDropdown = {
+        parent = mockLoadSys,
+        GetParent = function(self) return self.parent end,
+    }
+    mockLoadSys.dropdown = mockOwnerDropdown
+
+    local resolvedFrame = nil
+    local mockRoot = {
+        EnumerateElementDescriptions = function()
+            return function() return nil end
+        end,
+    }
+
+    local ok = pcall(function()
+        Menu.callbacks["MENU_CLASS_TALENT_PROFILE"](mockOwnerDropdown, mockRoot, nil)
+    end)
+    assert_true(ok, "OnModifyTalentMenu resolved talentsFrame from ownerRegion without globals")
+
+    PlayerSpellsFrame = savedPSF
+end
+
+-- Test 28: WoW 12.1 C_Traits.GetConfigInfo fallback for loadout names
+do
+    local pKey = addonNamespace.GetPlayerKey()
+    local specID = 250
+    local mockTalentsFrame = PlayerSpellsFrame.TalentsFrame
+    mockTalentsFrame.configIDToName = nil -- simulate missing cache
+
+    C_Traits = {
+        GetConfigInfo = function(id)
+            return { name = "TraitName_" .. id }
+        end,
+    }
+
+    mockTalentsFrame.LoadSystem.possibleSelections = { 501, 502 }
+    addonNamespace.ClearActiveButtons()
+    local b1 = CreateFrame("Button", "TraitsB1")
+    local b2 = CreateFrame("Button", "TraitsB2")
+    b1:SetRect(50, 200, 200, 20)
+    b2:SetRect(50, 180, 200, 20)
+    addonNamespace.SetupLoadoutButton(b1, { GetData = function() return 501 end, SetCanSelect = function() end }, nil, 501)
+    addonNamespace.SetupLoadoutButton(b2, { GetData = function() return 502 end, SetCanSelect = function() end }, nil, 502)
+
+    addonNamespace.StartDrag(b2)
+    cursorX, cursorY = 100, 215 -- Move to top
+    addonNamespace.UpdateDrag()
+    addonNamespace.FinishDrag()
+
+    local saved = addonNamespace.GetSavedOrder(pKey, specID)
+    assert_table_eq(saved.order, { 502, 501 }, "Order saved using C_Traits name resolution")
+    assert_eq(saved.names[502], "TraitName_502", "Config names populated via C_Traits.GetConfigInfo")
+
+    C_Traits = nil
+    mockTalentsFrame.configIDToName = {}
+end
+
+-- Test 29: TOC Interface Version Includes 120100 (Patch 12.1)
+do
+    local f = io.open("Reorder_Talent_Loadouts.toc", "r")
+    assert_true(f ~= nil, "TOC file exists and is readable")
+    local content = f:read("*all")
+    f:close()
+    assert_true(content:find("120100") ~= nil, "TOC specifies Interface 120100 for Patch 12.1")
+    assert_true(content:find("120000") ~= nil, "TOC specifies Interface 120000 for Patch 12.0")
+end
+
+-- Test 30: Full drag & drop lifecycle without global frames (ownerRegion resolved)
+do
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = nil
+
+    local pKey = addonNamespace.GetPlayerKey()
+    local isolatedSpecID = 777
+    local mockTalentParent = {
+        configIDs = { 101, 102 },
+        GetSpecID = function() return isolatedSpecID end,
+        RefreshLoadoutOptions = function() end,
+    }
+    local mockLoadSys = {
+        possibleSelections = { 101, 102 },
+        parent = mockTalentParent,
+        GetParent = function(self) return self.parent end,
+        UpdateSelectionOptions = function() end,
+    }
+    local mockOwnerDropdown = {
+        parent = mockLoadSys,
+        GetParent = function(self) return self.parent end,
+        GenerateMenu = function() end,
+    }
+    mockLoadSys.dropdown = mockOwnerDropdown
+    mockLoadSys.GetDropdown = function(self) return self.dropdown end
+
+    local desc1 = {
+        GetData = function() return 101 end,
+        SetCanSelect = function() end,
+        SetSoundKit = function() end,
+        AddInitializer = function(self, fn) self.init = fn end,
+    }
+    local desc2 = {
+        GetData = function() return 102 end,
+        SetCanSelect = function() end,
+        SetSoundKit = function() end,
+        AddInitializer = function(self, fn) self.init = fn end,
+    }
+
+    local mockRoot = {
+        EnumerateElementDescriptions = function()
+            local elements = { desc1, desc2 }
+            local i = 0
+            return function()
+                i = i + 1
+                if elements[i] then
+                    return i, elements[i]
+                end
+                return nil
+            end
+        end,
+        AddMenuReleasedCallback = function() end,
+    }
+
+    Menu.callbacks["MENU_CLASS_TALENT_PROFILE"](mockOwnerDropdown, mockRoot, nil)
+
+    local b1 = CreateFrame("Button", "OwnerRegionB1")
+    local b2 = CreateFrame("Button", "OwnerRegionB2")
+    b1:SetRect(50, 200, 200, 20)
+    b2:SetRect(50, 180, 200, 20)
+    desc1.init(b1, desc1, nil)
+    desc2.init(b2, desc2, nil)
+
+    addonNamespace.StartDrag(b2)
+    cursorX, cursorY = 100, 215 -- Move above b1
+    addonNamespace.UpdateDrag()
+    addonNamespace.FinishDrag()
+
+    local saved = addonNamespace.GetSavedOrder(pKey, isolatedSpecID)
+    assert_true(saved ~= nil, "Order saved to DB when PlayerSpellsFrame was nil")
+    assert_table_eq(saved.order, { 102, 101 }, "Correctly reordered loadouts using ownerRegion hierarchy")
+    assert_table_eq(mockLoadSys.possibleSelections, { 102, 101 }, "LoadSystem selections updated")
+
+    PlayerSpellsFrame = savedPSF
+end
+
+-- Test 31: OnRefreshLoadoutOptions uses C_SpecializationInfo fallback when GetSpecID is nil
+do
+    local pKey = addonNamespace.GetPlayerKey()
+    local specID = 251 -- Frost DK
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 902, 901 } }
+
+    local talentsFrame = PlayerSpellsFrame.TalentsFrame
+    local savedGetSpecID = talentsFrame.GetSpecID
+    talentsFrame.GetSpecID = nil -- Remove direct GetSpecID method
+
+    C_SpecializationInfo = {
+        GetSpecialization = function() return 2 end,
+        GetSpecializationInfo = function(idx)
+            if idx == 2 then return specID end
+            return nil
+        end,
+    }
+
+    talentsFrame.LoadSystem.possibleSelections = { 901, 902 }
+    talentsFrame.configIDs = { 901, 902 }
+
+    addonNamespace.InitializeTalentHooks()
+    talentsFrame:RefreshLoadoutOptions()
+
+    assert_table_eq(talentsFrame.LoadSystem.possibleSelections, { 902, 901 }, "OnRefreshLoadoutOptions sorted using C_SpecializationInfo fallback")
+
+    talentsFrame.GetSpecID = savedGetSpecID
+    C_SpecializationInfo = nil
+end
+
+-- Test 32: OnRefreshLoadoutOptions resolves loadout names via C_Traits when configIDToName is nil
+do
+    local pKey = addonNamespace.GetPlayerKey()
+    local specID = 250
+    local talentsFrame = PlayerSpellsFrame.TalentsFrame
+    talentsFrame.configIDToName = nil -- Simulate unpopulated cache
+
+    ReorderTalentLoadoutsDB[pKey][specID] = {
+        order = { 9999 }, -- Old config ID that got remapped in patch 12.1
+        names = { [9999] = "Raid_SingleTarget" },
+    }
+
+    C_Traits = {
+        GetConfigInfo = function(id)
+            if id == 701 then return { name = "Dungeon_AOE" } end
+            if id == 702 then return { name = "Raid_SingleTarget" } end
+            return nil
+        end,
+    }
+
+    talentsFrame.LoadSystem.possibleSelections = { 701, 702 }
+    talentsFrame.configIDs = { 701, 702 }
+
+    addonNamespace.InitializeTalentHooks()
+    talentsFrame:RefreshLoadoutOptions()
+
+    -- 702 matches name "Raid_SingleTarget" which was first in saved.order, so 702 comes first!
+    assert_table_eq(talentsFrame.LoadSystem.possibleSelections, { 702, 701 }, "OnRefreshLoadoutOptions successfully migrated order via C_Traits name resolution")
+
+    C_Traits = nil
+    talentsFrame.configIDToName = {}
+end
+
+-- Test 33: /rtl reset provides chat confirmation even if DB entry did not exist
+do
+    local pKey = addonNamespace.GetPlayerKey()
+    local specID = 250
+    if ReorderTalentLoadoutsDB[pKey] then
+        ReorderTalentLoadoutsDB[pKey][specID] = nil
+    end
+
+    local lastChatMessage = nil
+    DEFAULT_CHAT_FRAME.AddMessage = function(self, msg)
+        lastChatMessage = msg
+    end
+
+    SlashCmdList["REORDERTALENTLOADOUTS"]("reset")
+
+    assert_true(lastChatMessage ~= nil and lastChatMessage:find("Loadout order reset to default"), "/rtl reset provided chat confirmation feedback")
+end
+
+-- Test 34: WoW 12.1 InputUtil.GetCursorPosition integration during drag
+do
+    local inputUtilCalled = false
+    InputUtil = {
+        GetCursorPosition = function(parent)
+            inputUtilCalled = true
+            return 100, 215
+        end,
+    }
+
+    local b1 = CreateFrame("Button", "InputUtilB1")
+    local b2 = CreateFrame("Button", "InputUtilB2")
+    b1:SetRect(50, 200, 200, 20)
+    b2:SetRect(50, 180, 200, 20)
+    addonNamespace.ClearActiveButtons()
+    addonNamespace.SetupLoadoutButton(b1, { GetData = function() return 801 end, SetCanSelect = function() end }, nil, 801)
+    addonNamespace.SetupLoadoutButton(b2, { GetData = function() return 802 end, SetCanSelect = function() end }, nil, 802)
+
+    addonNamespace.StartDrag(b2)
+    addonNamespace.UpdateDrag()
+
+    assert_true(inputUtilCalled, "ns.UpdateDrag invoked InputUtil.GetCursorPosition(UIParent)")
+    addonNamespace.CancelDrag()
+    InputUtil = nil
+end
+
 print(string.format("\nTest Results: %d Passed, %d Failed", passed, failed))
 if failed > 0 then
     os.exit(1)
 else
     print("ALL TESTS PASSED SUCCESSFULLY!")
 end
+
 

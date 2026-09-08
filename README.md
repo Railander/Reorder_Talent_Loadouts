@@ -48,7 +48,7 @@ A lightweight, single-purpose World of Warcraft (Retail) addon that allows reord
 
 ## Compatibility
 
-- **Retail WoW**: The War Within (11.0+) and future expansions (12.0+).
+- **Retail WoW**: The War Within (11.0+) and Midnight (12.0 / 12.1, Interface `120100`). Fully verified against live Blizzard 12.1 FrameXML / Menu APIs.
 - **UI & Addon Compatibility**: Designed to be non-intrusive and compatible with popular UI addons such as _ElvUI_, _Talent Tree Tweaks_, _BlizzMove_, and _Talent Loadout Manager_.
 
 ---
