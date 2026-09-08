@@ -1455,18 +1455,26 @@ do
     Constants = savedConstants
 end
 
--- Test 41: reset button survives its own outside-click (deferred hide + menu reopen)
+-- Test 41: reset button press behavior (immediate hide, no collapse, gated visibility)
 do
     local f = io.open("Reorder_Talent_Loadouts.lua", "r")
     local source = f:read("*a")
     f:close()
 
-    assert_true(source:find("C_Timer.After(0.35", 1, true) ~= nil,
-        "Reset button hide is deferred on menu close (immediate hide cancels the in-flight click)")
+    assert_true(source:find('btn:SetScript("OnMouseDown"', 1, true) ~= nil,
+        "Reset happens on press (mouse-down), not release")
+    assert_true(source:find("self:SetShown(false);", 1, true) ~= nil,
+        "Reset button disappears immediately when pressed")
+    assert_true(source:find("C_Timer.After(0, function()", 1, true) ~= nil,
+        "Menu reopen is scheduled for the next frame (single-frame flicker at most)")
     assert_true(source:find("dd:OpenMenu()", 1, true) ~= nil,
         "Reset button reopens the dropdown after resetting (menu must not collapse on click)")
+    assert_true(source:find("IsSavedOrderPresent", 1, true) ~= nil,
+        "Reset button visibility is gated on a non-default saved order existing")
     assert_true(source:find('ns.ResetCurrentSpecOrder(false)', 1, true) ~= nil,
         "Button reset is silent (no chat spam); visual feedback is the reopened dropdown")
+    assert_true(source:find("SetOnClickHandler", 1, true) == nil,
+        "No release-based OnClick path remains on the reset button")
 end
 
 print(string.format("\nTest Results: %d Passed, %d Failed", passed, failed))

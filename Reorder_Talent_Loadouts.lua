@@ -61,6 +61,7 @@ local dragSourceButton = nil;
 local dragStartX, dragStartY = 0, 0;
 local currentDropTargetIndex = nil;
 local trackedButtons = {}; -- addon-side registry of loadout menu buttons: { button, configID }; never written onto Blizzard frames
+local UpdateResetButton; -- forward declaration: refreshes reset-button visibility (defined near the reset button)
 
 -- ----------------------------------------------------------------------------
 -- Utility Functions
@@ -594,6 +595,7 @@ end
 function ns.FinishDrag()
     -- Fail-open: the drop applies the persisted order; never raise into input handlers.
     SafeInvoke("finishDrag", FinishDragInner);
+    if UpdateResetButton then UpdateResetButton(); end
 end
 
 function ns.CancelDrag()
@@ -942,6 +944,8 @@ local function ReconcileInner()
         DebugNote("reconcile", ("selections=[%s], missing restored=%d")
             :format(table.concat(after, ","), #missing));
     end
+
+    if UpdateResetButton then UpdateResetButton(); end
 end
 
 ns.Reconcile = function()
@@ -1011,8 +1015,37 @@ local function ddOpen(dropdown)
     return dropdown and dropdown.IsMenuOpen and dropdown:IsMenuOpen();
 end
 
+-- The button only makes sense when the current spec's order deviates from default,
+-- i.e. a saved order exists in the DB.
+local function IsSavedOrderPresent()
+    local talentsFrame = GetTalentsFrame();
+    local specID = ns.GetSpecID(talentsFrame);
+    local saved = ns.GetSavedOrder(ns.GetPlayerKey(), specID);
+    return saved ~= nil and saved.order ~= nil and #saved.order > 0;
+end
+
+UpdateResetButton = function()
+    if not resetButton then return end
+    -- The button hides at press, so its OnMouseUp (icon restore) never fires; normalize
+    -- the press-depress offset whenever visibility is refreshed.
+    if resetButton.Icon then
+        resetButton.Icon:SetPoint("CENTER", resetButton, "CENTER");
+    end
+    local talentsFrame = GetTalentsFrame();
+    local loadSystem = talentsFrame and talentsFrame.LoadSystem;
+    local dropdown = loadSystem and loadSystem.GetDropdown and loadSystem:GetDropdown();
+    if ddOpen(dropdown) and IsSavedOrderPresent() then
+        resetButton:SetShown(true);
+    else
+        resetButton:SetShown(false);
+    end
+end
+ns.UpdateResetButton = UpdateResetButton;
+
 -- Icon button styled after the talents pane's "Undo Pending Changes" button
--- (IconButtonTemplate + talents-button-undo), shown only while the loadout dropdown is open.
+-- (IconButtonTemplate + talents-button-undo). Visible only while the loadout dropdown is
+-- open AND the current spec has a non-default saved order; it disappears the moment it is
+-- pressed and the reset happens on press (not release) so the dropdown never collapses.
 local function CreateResetButton(talentsFrame)
     if resetButton or not CreateFrame then
         return nil;
@@ -1038,21 +1071,34 @@ local function CreateResetButton(talentsFrame)
     btn:SetPoint("RIGHT", dropdown, "LEFT", -6, 0);
     btn:Hide();
 
-    -- Click: reset, then keep the dropdown open showing the result. Clicking the button is
-    -- an outside click for the open menu, so the menu closes on mouse-down; reopening here
-    -- (OpenMenu regenerates) makes the dropdown appear to never collapse.
-    btn:SetOnClickHandler(function()
+    -- Reset on PRESS: the button vanishes immediately, the saved order is cleared, and the
+    -- menu (which the menu system closes on this outside mouse-down) is reopened on the
+    -- next frame -- so the dropdown only ever flickers for at most a single frame.
+    btn:SetScript("OnMouseDown", function(self, mouseButton)
+        if mouseButton ~= "LeftButton" then return end
+        if self.Icon then
+            self.Icon:SetPoint("CENTER", self, "CENTER", 1, -1); -- press-depress visual
+        end
+        self:SetShown(false);
         SafeInvoke("resetButton", function()
             ns.ResetCurrentSpecOrder(false);
-            local talentsFrame = GetTalentsFrame();
-            local loadSystem = talentsFrame and talentsFrame.LoadSystem;
-            local dd = loadSystem and loadSystem.GetDropdown and loadSystem:GetDropdown();
-            if dd and dd.IsMenuOpen and not dd:IsMenuOpen() and dd.OpenMenu then
-                dd:OpenMenu();
-            elseif dd and dd.GenerateMenu then
-                dd:GenerateMenu();
+            if C_Timer and C_Timer.After then
+                C_Timer.After(0, function()
+                    local talentsFrame = GetTalentsFrame();
+                    local loadSystem = talentsFrame and talentsFrame.LoadSystem;
+                    local dd = loadSystem and loadSystem.GetDropdown and loadSystem:GetDropdown();
+                    if not ddOpen(dd) and dd and dd.OpenMenu then
+                        dd:OpenMenu();
+                    end
+                    UpdateResetButton();
+                end);
             end
         end);
+    end);
+    btn:SetScript("OnMouseUp", function(self)
+        if self.Icon then
+            self.Icon:SetPoint("CENTER", self, "CENTER"); -- restore press-depress visual
+        end
     end);
 
     -- Tooltip (own button; plain script is fine here)
@@ -1068,18 +1114,17 @@ local function CreateResetButton(talentsFrame)
         if GameTooltip then GameTooltip:Hide(); end
     end);
 
-    -- Show only while the loadout dropdown's menu is open (sanctioned pub-sub callbacks).
-    -- NOTE: the hide is deferred. Clicking this button itself closes the menu on mouse-down
-    -- (outside click); hiding immediately would cancel the in-flight click before OnClick
-    -- fires, so the button stays visible briefly and hides once the click has landed.
+    -- Visibility is fully derived: menu open AND a non-default saved order exists.
     if dropdown.RegisterCallback and DropdownButtonMixin and DropdownButtonMixin.Event then
         pcall(dropdown.RegisterCallback, dropdown, DropdownButtonMixin.Event.OnMenuOpen, function()
-            btn:SetShown(true);
+            UpdateResetButton();
         end);
         pcall(dropdown.RegisterCallback, dropdown, DropdownButtonMixin.Event.OnMenuClose, function()
+            -- Deferred so a click that is landing on the button as the menu closes
+            -- (outside-click close) is not visually yanked away mid-press.
             if C_Timer and C_Timer.After then
                 C_Timer.After(0.35, function()
-                    if not (ddOpen and ddOpen(dropdown)) then
+                    if not ddOpen(dropdown) then
                         btn:SetShown(false);
                     end
                 end);
