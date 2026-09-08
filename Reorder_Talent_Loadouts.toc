@@ -5,7 +5,6 @@
 ## Author: railander
 ## IconTexture: 132222
 ## X-Curse-Project-ID: 1687554
-## SavedVariables: ReorderTalentLoadoutsDB, ReorderTalentLoadoutsDebug
-## OptionalDeps: Blizzard_PlayerSpells, Blizzard_ClassTalentUI
+## SavedVariables: ReorderTalentLoadoutsDB
 
 Reorder_Talent_Loadouts.lua
