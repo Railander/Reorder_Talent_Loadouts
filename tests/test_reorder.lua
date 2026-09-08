@@ -1087,15 +1087,21 @@ do
     mockTalentsFrame.configIDToName = {}
 end
 
--- Test 29: TOC Interface Version Specifies 120100 Only (Patch 12.1)
+-- Test 29: TOC follows the project template (packager version, CurseForge id, icon)
 do
     local f = io.open("Reorder_Talent_Loadouts.toc", "r")
     assert_true(f ~= nil, "TOC file exists and is readable")
     local content = f:read("*all")
     f:close()
-    assert_true(content:find("## Interface: 120100") ~= nil, "TOC specifies Interface: 120100 for Patch 12.1 only")
-    assert_true(content:find("120000") == nil, "TOC does not include older 120000")
-    assert_true(content:find("110007") == nil, "TOC does not include older 110007")
+
+    assert_true(content:find("## Interface: 120000, 120100") ~= nil, "TOC lists supported client versions (Midnight 12.0/12.1)")
+    assert_true(content:find("## Version: @project%-version@") ~= nil, "TOC version uses @project-version@ for packager substitution")
+    assert_true(content:find("## X%-Curse%-Project%-ID: 1687554") ~= nil, "TOC carries the CurseForge project ID")
+    assert_true(content:find("## IconTexture: 132222") ~= nil, "TOC uses icon file data ID 132222")
+    assert_true(content:find("## Author: railander") ~= nil, "TOC author matches project convention")
+    assert_true(content:find("SavedVariables: ReorderTalentLoadoutsDB") ~= nil, "TOC keeps the SavedVariables declarations")
+    assert_true(content:find("OptionalDeps: Blizzard_PlayerSpells") ~= nil, "TOC keeps the Blizzard load-order deps")
+    assert_true(content:find("Reorder_Talent_Loadouts.lua") ~= nil, "TOC loads the addon lua")
 end
 
 -- Test 30: Full drag & drop lifecycle without global frames (ownerRegion resolved)
