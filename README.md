@@ -49,13 +49,14 @@ A lightweight, single-purpose World of Warcraft (Retail) addon that allows reord
 ## Compatibility
 
 - **Retail WoW**: The War Within (11.0+) and future expansions (12.0+).
-- **UI & Addon Compatibility**: Designed to be non-intrusive and compatible with popular UI addons such as *ElvUI*, *Talent Tree Tweaks*, *BlizzMove*, and *Talent Loadout Manager*.
+- **UI & Addon Compatibility**: Designed to be non-intrusive and compatible with popular UI addons such as _ElvUI_, _Talent Tree Tweaks_, _BlizzMove_, and _Talent Loadout Manager_.
 
 ---
 
 ## Automated Test Suite
 
 An automated test suite is included in `tests/test_reorder.lua` verifying:
+
 - Boundary movements, no-ops, and arbitrary slot reordering.
 - DB multi-character and multi-spec isolation.
 - Fallback matching for renamed/renumbered loadouts.
@@ -63,6 +64,7 @@ An automated test suite is included in `tests/test_reorder.lua` verifying:
 - Click vs drag distance threshold detection.
 
 To run the tests:
+
 ```bash
 lua tests/test_reorder.lua
 ```
