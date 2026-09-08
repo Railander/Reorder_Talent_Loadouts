@@ -1120,10 +1120,11 @@ local function CreateResetButton(talentsFrame)
             UpdateResetButton();
         end);
         pcall(dropdown.RegisterCallback, dropdown, DropdownButtonMixin.Event.OnMenuClose, function()
-            -- Deferred so a click that is landing on the button as the menu closes
-            -- (outside-click close) is not visually yanked away mid-press.
+            -- Hidden next frame: visually instant, but still ordered after the current
+            -- input dispatch so a press landing on the button as the menu closes (outside
+            -- click) always reaches the button's OnMouseDown first (reset happens on press).
             if C_Timer and C_Timer.After then
-                C_Timer.After(0.35, function()
+                C_Timer.After(0, function()
                     if not ddOpen(dropdown) then
                         btn:SetShown(false);
                     end
