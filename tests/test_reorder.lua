@@ -530,15 +530,15 @@ do
     assert_table_eq(mockTalentsFrame.LoadSystem.possibleSelections, { 103, 101, 102 }, "Off-menu drop cancelled, order preserved")
 end
 
--- Test 10: Slash Command Reset
+-- Test 10: ResetCurrentSpecOrder
 do
     local specID = 250
     local pKey = addonNamespace.GetPlayerKey()
     assert_true(ReorderTalentLoadoutsDB[pKey][specID] ~= nil, "DB exists before reset")
 
-    SlashCmdList["REORDERTALENTLOADOUTS"]("reset")
+    addonNamespace.ResetCurrentSpecOrder(false)
 
-    assert_true(ReorderTalentLoadoutsDB[pKey][specID] == nil, "DB cleared for spec after /rtl reset")
+    assert_true(ReorderTalentLoadoutsDB[pKey][specID] == nil, "DB cleared for spec after reset")
 end
 
 -- Test 11: Mid-Drag Combat Abort (PLAYER_REGEN_DISABLED)
@@ -1007,9 +1007,9 @@ do
         end,
     }
 
-    SlashCmdList["REORDERTALENTLOADOUTS"]("reset")
+    addonNamespace.ResetCurrentSpecOrder(false)
 
-    assert_true(ReorderTalentLoadoutsDB[pKey][specID] == nil, "/rtl reset used C_SpecializationInfo fallback when talent window is closed")
+    assert_true(ReorderTalentLoadoutsDB[pKey][specID] == nil, "Reset used C_SpecializationInfo fallback when talent window is closed")
 
     -- Restore
     PlayerSpellsFrame = savedPSF
@@ -1240,24 +1240,6 @@ do
     talentsFrame.configIDToName = {}
 end
 
--- Test 33: /rtl reset provides chat confirmation even if DB entry did not exist
-do
-    local pKey = addonNamespace.GetPlayerKey()
-    local specID = 250
-    if ReorderTalentLoadoutsDB[pKey] then
-        ReorderTalentLoadoutsDB[pKey][specID] = nil
-    end
-
-    local lastChatMessage = nil
-    DEFAULT_CHAT_FRAME.AddMessage = function(self, msg)
-        lastChatMessage = msg
-    end
-
-    SlashCmdList["REORDERTALENTLOADOUTS"]("reset")
-
-    assert_true(lastChatMessage ~= nil and lastChatMessage:find("Loadout order reset to default"), "/rtl reset provided chat confirmation feedback")
-end
-
 -- Test 34: WoW 12.1 InputUtil.GetCursorPosition integration during drag
 do
     local inputUtilCalled = false
@@ -1377,11 +1359,11 @@ do
     local savedPSF = PlayerSpellsFrame
     PlayerSpellsFrame = { TalentsFrame = mockTalentsFrame }
 
-    SlashCmdList["REORDERTALENTLOADOUTS"]("reset")
+    addonNamespace.ResetCurrentSpecOrder(false)
 
-    assert_true(ReorderTalentLoadoutsDB[pKey][specID] == nil, "/rtl reset clears the saved order")
-    assert_true(not refreshLoadoutOptionsCalled, "/rtl reset does NOT call talentsFrame:RefreshLoadoutOptions (taint rule)")
-    assert_true(setSelectionOptionsArgs ~= nil, "/rtl reset re-applies options via the taint-safe LoadSystem replica")
+    assert_true(ReorderTalentLoadoutsDB[pKey][specID] == nil, "Reset clears the saved order")
+    assert_true(not refreshLoadoutOptionsCalled, "Reset does NOT call talentsFrame:RefreshLoadoutOptions (taint rule)")
+    assert_true(setSelectionOptionsArgs ~= nil, "Reset re-applies options via the taint-safe LoadSystem replica")
     if setSelectionOptionsArgs then
         assert_table_eq(setSelectionOptionsArgs[1], { 501, 502 }, "Reset replica passes the frame's configIDs")
     end
@@ -1475,6 +1457,8 @@ do
         "Button reset is silent (no chat spam); visual feedback is the reopened dropdown")
     assert_true(source:find("SetOnClickHandler", 1, true) == nil,
         "No release-based OnClick path remains on the reset button")
+    assert_true(source:find("SlashCmdList", 1, true) == nil and source:find("SLASH_REORDERTALENTLOADOUTS", 1, true) == nil,
+        "No slash commands remain in the addon")
 end
 
 print(string.format("\nTest Results: %d Passed, %d Failed", passed, failed))
