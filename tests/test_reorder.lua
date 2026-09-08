@@ -652,14 +652,22 @@ end
 
 -- Test 15: Click vs Drag Threshold (< 5px does not drag)
 do
+    addonNamespace.ClearActiveButtons()
     local bTest = CreateFrame("Button", "ThresholdBtn")
-    bTest.rtLoadoutConfigID = 555
+    bTest:SetRect(50, 200, 200, 20)
     local desc = { GetData = function() return 555 end, SetCanSelect = function() end }
     addonNamespace.SetupLoadoutButton(bTest, desc, nil, 555)
+    bTest.mouseOverOverride = true
+    bTest:Show()
 
-    -- Mouse down
+    local evFrame = nil
+    for _, f in ipairs(mockFrames) do
+        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
+    end
+
+    -- Mouse down via the GLOBAL_MOUSE_DOWN event path
     cursorX, cursorY = 100, 100
-    bTest.scripts["OnMouseDown"](bTest, "LeftButton")
+    evFrame.scripts["OnEvent"](evFrame, "GLOBAL_MOUSE_DOWN", "LeftButton")
 
     -- Mouse moves only 2 pixels (distance < 5px)
     cursorX, cursorY = 101, 101
@@ -674,34 +682,33 @@ do
     -- Verify drag did NOT start
     assert_true(bTest:GetAlpha() == 1.0, "Movement <= 5px does not start drag")
 
-    -- Mouse up
-    bTest.scripts["OnMouseUp"](bTest, "LeftButton")
+    -- Mouse up via the GLOBAL_MOUSE_UP event path
+    evFrame.scripts["OnEvent"](evFrame, "GLOBAL_MOUSE_UP", "LeftButton")
     leftMouseDown = false
     assert_true(bTest:GetAlpha() == 1.0, "Button remains in normal state after normal click")
 end
 
--- Test 16: Frame Pool Reuse & Drag Re-arming
+-- Test 16: Frame Pool Reuse Registry Update (addon-side registry; no Blizzard-frame writes)
 do
     local bPool = CreateFrame("Button", "PooledBtn")
     local desc = { GetData = function() return 777 end, SetCanSelect = function() end }
     addonNamespace.SetupLoadoutButton(bPool, desc, nil, 777)
-    assert_true(bPool.registeredDrag ~= nil and bPool.registeredDrag[1] == "LeftButton", "Pooled button registered for drag initially")
+    local entry = addonNamespace.FindTrackedEntry(bPool)
+    assert_true(entry ~= nil and entry.configID == 777, "Pooled button tracked in addon registry")
 
-    -- Simulate frame pool reset (Blizzard SetToDefaults wipes registeredDrag)
-    bPool.registeredDrag = nil
-    assert_true(bPool.registeredDrag == nil, "Drag registration wiped by pool reset")
-
-    -- Second menu open reuses bPool from pool
+    -- Second menu open reuses bPool from the pool for a different loadout
     addonNamespace.SetupLoadoutButton(bPool, desc, nil, 888)
-    assert_true(bPool.registeredDrag ~= nil and bPool.registeredDrag[1] == "LeftButton", "Pooled button re-registers drag on reuse")
-    assert_true(bPool.rtLoadoutConfigID == 888, "Pooled button config ID updated")
+    entry = addonNamespace.FindTrackedEntry(bPool)
+    -- FindTrackedEntry returns the FIRST match; a duplicated registry entry would still
+    -- report the original 777 here, so this also proves no duplication happened.
+    assert_true(entry.configID == 888, "Pooled button config ID updated in place")
 end
 
 -- Test 17: Utility Button (Gear Edit Button) Exclusion
 do
+    addonNamespace.ClearActiveButtons()
     local rowBtn = CreateFrame("Button", "RowBtn")
     rowBtn:SetRect(50, 200, 200, 20)
-    rowBtn.rtLoadoutConfigID = 999
     local desc = { GetData = function() return 999 end, SetCanSelect = function() end }
     addonNamespace.SetupLoadoutButton(rowBtn, desc, nil, 999)
 
@@ -710,18 +717,16 @@ do
     gearChild.mouseOverOverride = true
     gearChild:Show()
 
-    -- Try OnDragStart while over gear child
+    -- Mouse down over the row (cursor inside row, over the gear child):
+    -- the GLOBAL_MOUSE_DOWN handler must skip the row entirely.
     addonNamespace.CancelDrag()
-    rowBtn.scripts["OnDragStart"](rowBtn)
-    assert_true(rowBtn:GetAlpha() == 1.0, "Drag start blocked when hovering over gear edit child button")
-
-    -- Try OnMouseDown while over gear child
     cursorX, cursorY = 100, 100
-    rowBtn.scripts["OnMouseDown"](rowBtn, "LeftButton")
+    rowBtn:Show()
     local evFrame = nil
     for _, f in ipairs(mockFrames) do
         if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
     end
+    evFrame.scripts["OnEvent"](evFrame, "GLOBAL_MOUSE_DOWN", "LeftButton")
     cursorX, cursorY = 150, 150
     leftMouseDown = true
     evFrame.scripts["OnUpdate"](evFrame, 0.016)
@@ -902,7 +907,7 @@ do
     assert_true(capturedSoundFunc ~= nil, "SetSoundKit wrapper was installed")
     -- When dragging: returns 0 (silent)
     local bSound = CreateFrame("Button", "SoundTestBtn")
-    bSound.rtLoadoutConfigID = 999
+    addonNamespace.SetupLoadoutButton(bSound, { GetData = function() return 999 end, SetCanSelect = function() end }, nil, 999)
     addonNamespace.StartDrag(bSound)
     assert_true(capturedSoundFunc(mockDesc) == 0, "Sound suppressed (0) while isDragging is true")
     addonNamespace.CancelDrag()
@@ -1192,9 +1197,11 @@ do
     talentsFrame.configIDs = { 901, 902 }
 
     addonNamespace.InitializeTalentHooks()
-    talentsFrame:RefreshLoadoutOptions()
+    -- No Blizzard Lua method is hooked (12.1 taint rule); the saved order is applied by the
+    -- pure-data poller path (OnRefreshLoadoutOptions), which the OnUpdate poller invokes.
+    addonNamespace.OnRefreshLoadoutOptions(talentsFrame)
 
-    assert_table_eq(talentsFrame.LoadSystem.possibleSelections, { 902, 901 }, "OnRefreshLoadoutOptions sorted using C_SpecializationInfo fallback")
+    assert_table_eq(talentsFrame.LoadSystem.possibleSelections, { 902, 901 }, "Poller sort path applied saved order using C_SpecializationInfo fallback")
 
     talentsFrame.GetSpecID = savedGetSpecID
     C_SpecializationInfo = nil
@@ -1224,10 +1231,10 @@ do
     talentsFrame.configIDs = { 701, 702 }
 
     addonNamespace.InitializeTalentHooks()
-    talentsFrame:RefreshLoadoutOptions()
+    addonNamespace.OnRefreshLoadoutOptions(talentsFrame)
 
     -- 702 matches name "Raid_SingleTarget" which was first in saved.order, so 702 comes first!
-    assert_table_eq(talentsFrame.LoadSystem.possibleSelections, { 702, 701 }, "OnRefreshLoadoutOptions successfully migrated order via C_Traits name resolution")
+    assert_table_eq(talentsFrame.LoadSystem.possibleSelections, { 702, 701 }, "Poller sort path successfully migrated order via C_Traits name resolution")
 
     C_Traits = nil
     talentsFrame.configIDToName = {}
@@ -1328,6 +1335,124 @@ do
     addonNamespace.OnRefreshLoadoutOptions(talentsFrame)
 
     assert_true(not updateSelectionOptionsCalled, "UpdateSelectionOptions was NOT called (Blizzard untainted generator preserved)")
+end
+
+-- Test 38: WoW 12.1 taint rule - RefreshLoadoutOptions is NEVER hooksecurefunc'd or called from addon code
+do
+    local f = io.open("Reorder_Talent_Loadouts.lua", "r")
+    local source = f:read("*a")
+    f:close()
+
+    assert_true(source:find('hooksecurefunc%(talentsFrame, "RefreshLoadoutOptions"', 1, true) == nil,
+        "RefreshLoadoutOptions is never hooksecurefunc'd (hooking taints its body and breaks restricted C_ClassTalents calls)")
+    assert_true(source:find("talentsFrame:RefreshLoadoutOptions()", 1, true) == nil,
+        "RefreshLoadoutOptions is never called from addon execution (restricted GetConfigIDsBySpecID under tainted execution)")
+    assert_true(source:find('hooksecurefunc(talentsFrame.LoadSystem, "SetSelectionOptions"', 1, true) == nil,
+        "LoadSystem:SetSelectionOptions is never hooksecurefunc'd either (no Blizzard Lua method is hooked at all in 12.1)")
+    assert_true(source:find("hooksecurefunc", 1, true) == nil,
+        "The addon contains ZERO hooksecurefunc calls (even SecretArguments-protected C functions degrade when hooked)")
+end
+
+-- Test 39: /rtl reset uses taint-safe SetSelectionOptions replica instead of the frame method
+do
+    local pKey = addonNamespace.GetPlayerKey()
+    local specID = 260
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 502, 501 } }
+
+    local refreshLoadoutOptionsCalled = false
+    local setSelectionOptionsArgs = nil
+    local mockTalentsFrame = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        configIDs = { 501, 502 },
+        configIDToName = { [501] = "A", [502] = "B" },
+        RefreshLoadoutOptions = function(self) refreshLoadoutOptionsCalled = true end,
+        LoadSystem = {
+            SetSelectionOptions = function(self, ...)
+                setSelectionOptionsArgs = { ... }
+            end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = mockTalentsFrame }
+
+    SlashCmdList["REORDERTALENTLOADOUTS"]("reset")
+
+    assert_true(ReorderTalentLoadoutsDB[pKey][specID] == nil, "/rtl reset clears the saved order")
+    assert_true(not refreshLoadoutOptionsCalled, "/rtl reset does NOT call talentsFrame:RefreshLoadoutOptions (taint rule)")
+    assert_true(setSelectionOptionsArgs ~= nil, "/rtl reset re-applies options via the taint-safe LoadSystem replica")
+    if setSelectionOptionsArgs then
+        assert_table_eq(setSelectionOptionsArgs[1], { 501, 502 }, "Reset replica passes the frame's configIDs")
+    end
+
+    PlayerSpellsFrame = savedPSF
+end
+
+-- Test 40: poller repopulates the dropdown when Blizzard's population came back degraded
+do
+    local specID = 270
+    local savedCT = C_ClassTalents
+    local savedTraits = C_Traits
+    local savedConstants = Constants
+
+    C_ClassTalents = {
+        GetConfigIDsBySpecID = function(id)
+            if id == specID then return { 601, 602, 603 } end
+            return {}
+        end,
+    }
+    C_Traits = {
+        GetConfigInfo = function(id)
+            return { name = "Loadout " .. id }
+        end,
+    }
+    Constants = { TraitConsts = { STARTER_BUILD_TRAIT_CONFIG_ID = -2 } }
+
+    local setSelectionOptionsArgs = nil
+    local mockTalentsFrame = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        GetHasStarterBuild = function() return true end,
+        configIDToName = { [-2] = "Starter Build" },
+        LoadSystem = {
+            SetSelectionOptions = function(self, options, nameFn, color, tooltipFn)
+                setSelectionOptionsArgs = { options = options, nameFn = nameFn, tooltipFn = tooltipFn }
+                self.possibleSelections = CopyTable(options) -- mirror the real mixin's behavior
+            end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = mockTalentsFrame }
+
+    -- Degraded state: only the Starter Build sentinel survived
+    mockTalentsFrame.LoadSystem.possibleSelections = { -2 }
+
+    addonNamespace.Reconcile()
+
+    assert_true(setSelectionOptionsArgs ~= nil, "Reconcile repopulates degraded dropdown via SetSelectionOptions replica")
+    if setSelectionOptionsArgs then
+        -- Merge-only: existing entries stay first, missing ground truth is appended
+        assert_table_eq(setSelectionOptionsArgs.options, { -2, 601, 602, 603 },
+            "Repopulate merges ground-truth loadouts behind existing entries")
+        assert_true(setSelectionOptionsArgs.nameFn(601) == "Loadout 601", "Repopulate resolves loadout names")
+        assert_true(setSelectionOptionsArgs.nameFn(-2) ~= nil and setSelectionOptionsArgs.nameFn(-2) ~= "",
+            "Repopulate resolves Starter Build name")
+        -- Dropdown state now holds the restored list
+        assert_table_eq(mockTalentsFrame.LoadSystem.possibleSelections, { -2, 601, 602, 603 },
+            "possibleSelections restored from addon-context ground truth")
+    end
+
+    -- A healthy population is left untouched: existing full list, no ground-truth IDs missing
+    setSelectionOptionsArgs = nil
+    mockTalentsFrame.LoadSystem.possibleSelections = { 601, 602, 603, -2 }
+    addonNamespace.Reconcile()
+    assert_true(setSelectionOptionsArgs == nil, "Reconcile does not repopulate when the list is already complete")
+
+    PlayerSpellsFrame = savedPSF
+    C_ClassTalents = savedCT
+    C_Traits = savedTraits
+    Constants = savedConstants
 end
 
 print(string.format("\nTest Results: %d Passed, %d Failed", passed, failed))

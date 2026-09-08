@@ -10,6 +10,48 @@ local ADDON_NAME, ns = ...;
 -- Global Database
 ReorderTalentLoadoutsDB = ReorderTalentLoadoutsDB or {};
 
+-- Diagnostics: persisted so failures can be inspected after a session (/rtl debug).
+-- The addon is built fail-open: an internal error must never break Blizzard's menu
+-- generation or the talent frame init chain; it is captured and reported instead.
+ReorderTalentLoadoutsDebug = ReorderTalentLoadoutsDebug or { errors = {}, log = {} };
+local diag = ReorderTalentLoadoutsDebug;
+
+local function DebugNote(key, text)
+	diag.log[key] = text;
+end
+
+local unpack = unpack or table.unpack;
+
+-- Runs fn(...) while converting any error into a captured report.
+-- This guarantees the calling (Blizzard) execution chain always continues.
+local function SafeInvoke(scope, fn, ...)
+	local args = {};
+	local n = select("#", ...);
+	for i = 1, n do
+		args[i] = select(i, ...);
+	end
+	local results = { xpcall(fn, function(e)
+		local stack;
+		if debugstack then
+			stack = debugstack(2, 6, 0);
+		elseif debug and debug.traceback then
+			stack = debug.traceback("", 2);
+		end
+		return tostring(e) .. (stack and ("\n" .. stack) or "");
+	end, unpack(args, 1, n)) };
+	if not results[1] then
+		local err = tostring(results[2] or "unknown error");
+		if not diag.errors[scope] then
+			diag.errors[scope] = err;
+			if DEFAULT_CHAT_FRAME then
+				DEFAULT_CHAT_FRAME:AddMessage("|cffff3333Reorder Talent Loadouts [" .. scope .. "] error:|r " .. err);
+			end
+		end
+		return false;
+	end
+	return true;
+end
+
 -- Local state variables
 local isDragging = false;
 local potentialDrag = false;
@@ -18,7 +60,7 @@ local dragSourceConfigID = nil;
 local dragSourceButton = nil;
 local dragStartX, dragStartY = 0, 0;
 local currentDropTargetIndex = nil;
-local activeLoadoutButtons = {};
+local trackedButtons = {}; -- addon-side registry of loadout menu buttons: { button, configID }; never written onto Blizzard frames
 
 -- ----------------------------------------------------------------------------
 -- Utility Functions
@@ -296,48 +338,10 @@ end
 -- UI Indicators (Drag Preview & Insertion Line)
 -- ----------------------------------------------------------------------------
 
-local dragPreviewFrame = nil;
 local insertionLine = nil;
 
 local function CreateUIElements()
-    if dragPreviewFrame then return end
-
-    -- Floating Drag Thumbnail
-    dragPreviewFrame = CreateFrame("Frame", "ReorderTalentLoadoutsDragPreview", UIParent, "BackdropTemplate");
-    dragPreviewFrame:SetSize(200, 26);
-    dragPreviewFrame:SetFrameStrata("TOOLTIP");
-    dragPreviewFrame:SetFrameLevel(9999);
-    dragPreviewFrame:SetClampedToScreen(true);
-    dragPreviewFrame:EnableMouse(false);
-
-    if dragPreviewFrame.SetBackdrop then
-        dragPreviewFrame:SetBackdrop({
-            bgFile = "Interface\\Buttons\\WHITE8X8",
-            edgeFile = "Interface\\Buttons\\WHITE8X8",
-            tile = false,
-            edgeSize = 1,
-            insets = { left = 1, right = 1, top = 1, bottom = 1 },
-        });
-        dragPreviewFrame:SetBackdropColor(0.08, 0.08, 0.12, 0.95);
-        dragPreviewFrame:SetBackdropBorderColor(0.9, 0.75, 0.15, 1.0);
-    end
-
-    local icon = dragPreviewFrame:CreateTexture(nil, "ARTWORK");
-    icon:SetSize(18, 18);
-    icon:SetPoint("LEFT", 4, 0);
-    icon:SetTexture("Interface\\Icons\\INV_Misc_Book_09");
-    icon:SetTexCoord(0.08, 0.92, 0.08, 0.92);
-    dragPreviewFrame.icon = icon;
-
-    local label = dragPreviewFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal");
-    label:SetPoint("LEFT", icon, "RIGHT", 6, 0);
-    label:SetPoint("RIGHT", -6, 0);
-    label:SetJustifyH("LEFT");
-    label:SetText("");
-    label:SetTextColor(1.0, 0.82, 0.0, 1.0);
-    dragPreviewFrame.label = label;
-
-    dragPreviewFrame:Hide();
+    if insertionLine then return end
 
     -- Insertion Indicator Line
     insertionLine = CreateFrame("Frame", "ReorderTalentLoadoutsInsertionLine", UIParent);
@@ -381,8 +385,8 @@ end
 -- Drag & Drop Engine
 -- ----------------------------------------------------------------------------
 
-function ns.StartDrag(button)
-    if isDragging or not button or not button.rtLoadoutConfigID then
+local function StartDragInner(button)
+    if isDragging or not button or not ns.FindTrackedEntry(button) then
         return;
     end
     if InCombatLockdown and InCombatLockdown() then
@@ -391,35 +395,24 @@ function ns.StartDrag(button)
 
     CreateUIElements();
 
+    local entry = ns.FindTrackedEntry(button);
     isDragging = true;
     potentialDrag = false;
     dragSourceButton = button;
-    dragSourceConfigID = button.rtLoadoutConfigID;
+    dragSourceConfigID = entry and entry.configID or nil;
 
     -- Dim the source row to visually distinguish it
     button:SetAlpha(0.35);
 
-    -- Set drag thumbnail text and icon
-    local talentsFrame = GetTalentsFrame(button, true);
-    local configIDToName = ns.GetConfigIDToName(talentsFrame, { dragSourceConfigID });
-    local loadoutName = configIDToName[dragSourceConfigID];
-    if not loadoutName or loadoutName == "" then
-        if button.fontString and button.fontString.GetText then
-            local btnText = button.fontString:GetText();
-            if btnText and btnText ~= "" then
-                loadoutName = btnText;
-            end
-        end
-    end
-    loadoutName = loadoutName or "Loadout";
-
-    dragPreviewFrame.label:SetText(loadoutName);
-    dragPreviewFrame:Show();
-
     ns.UpdateDrag();
 end
 
-function ns.UpdateDrag()
+function ns.StartDrag(button)
+    -- Fail-open: drag start must never raise into Blizzard input handling.
+    SafeInvoke("startDrag", StartDragInner, button);
+end
+
+local function UpdateDragInner()
     if not isDragging then return end
 
     local cursorX, cursorY;
@@ -432,13 +425,7 @@ function ns.UpdateDrag()
         cursorY = curY / scale;
     end
 
-    -- Position the floating preview frame near the cursor
-    if dragPreviewFrame then
-        dragPreviewFrame:ClearAllPoints();
-        dragPreviewFrame:SetPoint("CENTER", UIParent, "BOTTOMLEFT", cursorX + 25, cursorY - 12);
-    end
-
-    local totalButtons = #activeLoadoutButtons;
+    local totalButtons = #trackedButtons;
     if totalButtons == 0 or not insertionLine then
         if insertionLine then insertionLine:Hide(); end
         currentDropTargetIndex = nil;
@@ -446,8 +433,8 @@ function ns.UpdateDrag()
     end
 
     -- Check bounds relative to the loadout rows
-    local firstBtn = activeLoadoutButtons[1];
-    local lastBtn = activeLoadoutButtons[totalButtons];
+    local firstBtn = trackedButtons[1].button;
+    local lastBtn = trackedButtons[totalButtons].button;
     local bLeft, bBottom, bWidth, bHeight = firstBtn:GetRect();
     local lastLeft, lastBottom, lastWidth, lastHeight = lastBtn:GetRect();
     if not bLeft or not lastBottom then
@@ -470,7 +457,7 @@ function ns.UpdateDrag()
     -- Find target index based on vertical cursor position (top-to-bottom layout)
     local targetIndex = totalButtons + 1;
     for i = 1, totalButtons do
-        local btn = activeLoadoutButtons[i];
+        local btn = trackedButtons[i].button;
         local left, bottom, width, height = btn:GetRect();
         if left and bottom and height then
             local midY = bottom + height / 2;
@@ -486,19 +473,23 @@ function ns.UpdateDrag()
     -- Anchor the insertion line directly at the boundary
     insertionLine:ClearAllPoints();
     if targetIndex == 1 then
-        insertionLine:SetPoint("BOTTOMLEFT", activeLoadoutButtons[1], "TOPLEFT", -2, -1);
-        insertionLine:SetPoint("BOTTOMRIGHT", activeLoadoutButtons[1], "TOPRIGHT", 2, -1);
+        insertionLine:SetPoint("BOTTOMLEFT", trackedButtons[1].button, "TOPLEFT", -2, -1);
+        insertionLine:SetPoint("BOTTOMRIGHT", trackedButtons[1].button, "TOPRIGHT", 2, -1);
     elseif targetIndex <= totalButtons then
-        insertionLine:SetPoint("BOTTOMLEFT", activeLoadoutButtons[targetIndex], "TOPLEFT", -2, -1);
-        insertionLine:SetPoint("BOTTOMRIGHT", activeLoadoutButtons[targetIndex], "TOPRIGHT", 2, -1);
+        insertionLine:SetPoint("BOTTOMLEFT", trackedButtons[targetIndex].button, "TOPLEFT", -2, -1);
+        insertionLine:SetPoint("BOTTOMRIGHT", trackedButtons[targetIndex].button, "TOPRIGHT", 2, -1);
     else
-        insertionLine:SetPoint("TOPLEFT", activeLoadoutButtons[totalButtons], "BOTTOMLEFT", -2, 1);
-        insertionLine:SetPoint("TOPRIGHT", activeLoadoutButtons[totalButtons], "BOTTOMRIGHT", 2, 1);
+        insertionLine:SetPoint("TOPLEFT", trackedButtons[totalButtons].button, "BOTTOMLEFT", -2, 1);
+        insertionLine:SetPoint("TOPRIGHT", trackedButtons[totalButtons].button, "BOTTOMRIGHT", 2, 1);
     end
     insertionLine:Show();
 end
 
-function ns.FinishDrag()
+function ns.UpdateDrag()
+    SafeInvoke("updateDrag", UpdateDragInner);
+end
+
+local function FinishDragInner()
     if not isDragging and not potentialDrag then
         return;
     end
@@ -517,7 +508,6 @@ function ns.FinishDrag()
         justFinishedDragging = false;
     end
 
-    if dragPreviewFrame then dragPreviewFrame:Hide(); end
     if insertionLine then insertionLine:Hide(); end
 
     if dragSourceButton then
@@ -601,6 +591,11 @@ function ns.FinishDrag()
     end
 end
 
+function ns.FinishDrag()
+    -- Fail-open: the drop applies the persisted order; never raise into input handlers.
+    SafeInvoke("finishDrag", FinishDragInner);
+end
+
 function ns.CancelDrag()
     if isDragging or potentialDrag then
         isDragging = false;
@@ -614,7 +609,6 @@ function ns.CancelDrag()
             justFinishedDragging = false;
         end
 
-        if dragPreviewFrame then dragPreviewFrame:Hide(); end
         if insertionLine then insertionLine:Hide(); end
 
         if dragSourceButton then
@@ -628,7 +622,7 @@ function ns.CancelDrag()
 end
 
 function ns.ClearActiveButtons()
-    wipe(activeLoadoutButtons);
+    wipe(trackedButtons);
 end
 
 -- ----------------------------------------------------------------------------
@@ -646,33 +640,57 @@ local function IsMouseOverUtilityButton(button)
     return false;
 end
 
+-- Called from the sanctioned menu-description initializer. Button state lives in the
+-- addon-side registry; the only things we add to the button itself are drag post-hooks
+-- via HookScript (the sanctioned form -- runs after Blizzard's handlers, and verified
+-- working in-game on these menu buttons). We do not touch any other Blizzard frame.
 function ns.SetupLoadoutButton(button, description, menu, configID)
-    button.rtLoadoutConfigID = configID;
-    button.rtLoadoutDesc = description;
-    button.rtLoadoutMenu = menu;
-
-    -- Register in activeLoadoutButtons
-    local alreadyPresent = false;
-    for i, b in ipairs(activeLoadoutButtons) do
-        if b == button then
-            alreadyPresent = true;
+    local entry = nil;
+    for i, e in ipairs(trackedButtons) do
+        if e.button == button then
+            entry = e;
             break;
         end
     end
-    if not alreadyPresent then
-        table.insert(activeLoadoutButtons, button);
+    if entry then
+        entry.configID = configID; -- pooled button re-used for a different entry
+    else
+        entry = { button = button, configID = configID };
+        table.insert(trackedButtons, entry);
     end
 
-    -- ALWAYS re-arm drag on pooled buttons every time they are initialized from the pool
+    -- Drag UX hooks (post-hooks only; verified safe on menu item buttons).
     if button.RegisterForDrag then
         button:RegisterForDrag("LeftButton");
     end
+    if button.HookScript and not button.rtDragHooked then
+        button.rtDragHooked = true;
+        button:HookScript("OnMouseDown", function(self, mouseButton)
+            if mouseButton == "LeftButton" and not (InCombatLockdown and InCombatLockdown()) then
+                if IsMouseOverUtilityButton(self) then
+                    return;
+                end
+                potentialDrag = true;
+                dragSourceButton = self;
+                local e = ns.FindTrackedEntry(self);
+                dragSourceConfigID = e and e.configID or nil;
+                dragStartX, dragStartY = GetCursorPosition();
+            end
+        end);
+        button:HookScript("OnMouseUp", function(self, mouseButton)
+            if mouseButton == "LeftButton" then
+                if isDragging then
+                    ns.FinishDrag();
+                else
+                    potentialDrag = false;
+                end
+            end
+        end);
+    end
     if button.SetScript then
         button:SetScript("OnDragStart", function(self)
-            if not (InCombatLockdown and InCombatLockdown()) then
-                if not IsMouseOverUtilityButton(self) then
-                    ns.StartDrag(self);
-                end
+            if not (InCombatLockdown and InCombatLockdown()) and not IsMouseOverUtilityButton(self) then
+                ns.StartDrag(self);
             end
         end);
         button:SetScript("OnDragStop", function(self)
@@ -682,42 +700,27 @@ function ns.SetupLoadoutButton(button, description, menu, configID)
         end);
     end
 
-    if not button.rtDragHooked then
-        button.rtDragHooked = true;
+    return entry;
+end
 
-        if button.HookScript then
-            button:HookScript("OnMouseDown", function(self, mouseButton)
-                if mouseButton == "LeftButton" and not (InCombatLockdown and InCombatLockdown()) then
-                    if IsMouseOverUtilityButton(self) then
-                        return;
-                    end
-
-                    potentialDrag = true;
-                    dragSourceButton = self;
-                    dragSourceConfigID = self.rtLoadoutConfigID;
-                    dragStartX, dragStartY = GetCursorPosition();
-                end
-            end);
-
-            button:HookScript("OnMouseUp", function(self, mouseButton)
-                if mouseButton == "LeftButton" then
-                    if isDragging then
-                        ns.FinishDrag();
-                    else
-                        potentialDrag = false;
-                    end
-                end
-            end);
+function ns.FindTrackedEntry(button)
+    for i, entry in ipairs(trackedButtons) do
+        if entry.button == button then
+            return entry, i;
         end
     end
+    return nil;
 end
 
 local InitializeTalentHooks;
 
-local function OnModifyTalentMenu(ownerRegion, rootDescription, contextData)
+local function OnModifyTalentMenuInner(ownerRegion, rootDescription, contextData)
     local talentsFrame = GetTalentsFrame(ownerRegion);
     local loadSystem = (talentsFrame and talentsFrame.LoadSystem) or GetLoadSystem(ownerRegion);
-    if not loadSystem then return end
+    if not loadSystem then
+        DebugNote("menuCallback", "ran but no loadSystem was resolved (talent frame not found)");
+        return
+    end
     if talentsFrame and talentsFrame.IsInspecting and talentsFrame:IsInspecting() then return end
 
     if talentsFrame then
@@ -737,8 +740,8 @@ local function OnModifyTalentMenu(ownerRegion, rootDescription, contextData)
         selectionSet[id] = true;
     end
 
-    -- Clear active buttons for the newly generated menu instance
-    wipe(activeLoadoutButtons);
+    -- Clear the addon-side button registry for the newly generated menu instance
+    wipe(trackedButtons);
 
     -- Auto-cancel drag and cleanup when the menu is released/closed
     if rootDescription.AddMenuReleasedCallback then
@@ -750,46 +753,63 @@ local function OnModifyTalentMenu(ownerRegion, rootDescription, contextData)
         end);
     end
 
+    local matched, enhanced = 0, 0;
     for index, desc in rootDescription:EnumerateElementDescriptions() do
         if desc and desc.GetData then
             local data = desc:GetData();
             if data and selectionSet[data] then
-            -- This description represents a loadout entry!
-            -- Suppress click selection during drag
-            desc:SetCanSelect(function()
-                if isDragging or justFinishedDragging then
-                    return false;
-                end
-                return true;
-            end);
+                matched = matched + 1;
+                -- This description represents a loadout entry!
+                local ok = SafeInvoke("menu-element", function()
+                    -- Suppress click selection during drag
+                    desc:SetCanSelect(function()
+                        if isDragging or justFinishedDragging then
+                            return false;
+                        end
+                        return true;
+                    end);
 
-            -- Suppress click sound when dragging or immediately after dropping
-            -- Note: In WoW 12.1+, desc:GetSoundKit() raises an error if soundKit is nil, so wrap in pcall
-            local origSoundKit = nil;
-            if desc.GetSoundKit then
-                local ok, sk = pcall(desc.GetSoundKit, desc);
+                    -- Suppress click sound when dragging or immediately after dropping
+                    -- Note: In WoW 12.1+, desc:GetSoundKit() raises an error if soundKit is nil, so wrap in pcall
+                    local origSoundKit = nil;
+                    if desc.GetSoundKit then
+                        local okSk, sk = pcall(desc.GetSoundKit, desc);
+                        if okSk then
+                            origSoundKit = sk;
+                        end
+                    end
+                    desc:SetSoundKit(function(elementDesc)
+                        if isDragging or justFinishedDragging then
+                            return 0;
+                        end
+                        if type(origSoundKit) == "function" then
+                            return origSoundKit(elementDesc);
+                        elseif type(origSoundKit) == "number" then
+                            return origSoundKit;
+                        end
+                        return (SOUNDKIT and SOUNDKIT.U_CHAT_SCROLL_BUTTON) or 0;
+                    end);
+
+                    desc:AddInitializer(function(button, description, menu)
+                        ns.SetupLoadoutButton(button, description, menu, data);
+                    end);
+                end);
                 if ok then
-                    origSoundKit = sk;
+                    enhanced = enhanced + 1;
                 end
-            end
-            desc:SetSoundKit(function(elementDesc)
-                if isDragging or justFinishedDragging then
-                    return 0;
-                end
-                if type(origSoundKit) == "function" then
-                    return origSoundKit(elementDesc);
-                elseif type(origSoundKit) == "number" then
-                    return origSoundKit;
-                end
-                return (SOUNDKIT and SOUNDKIT.U_CHAT_SCROLL_BUTTON) or 0;
-            end);
-
-            desc:AddInitializer(function(button, description, menu)
-                ns.SetupLoadoutButton(button, description, menu, data);
-            end);
             end
         end
     end
+
+    DebugNote("menuCallback", ("ran: possibleSelections=%d, loadout elements matched=%d, enhanced=%d")
+        :format(#possibleSelections, matched, enhanced));
+end
+
+local function OnModifyTalentMenu(ownerRegion, rootDescription, contextData)
+    diag.menuCallbacks = (diag.menuCallbacks or 0) + 1;
+    -- Fail-open: an error in this callback would abort Blizzard's GenerateMenu, which is
+    -- exactly what blanking the dropdown looks like. Capture and continue instead.
+    SafeInvoke("menu", OnModifyTalentMenuInner, ownerRegion, rootDescription, contextData);
 end
 
 -- ----------------------------------------------------------------------------
@@ -798,7 +818,7 @@ end
 
 local hooksInstalled = false;
 
-local function OnRefreshLoadoutOptions(talentsFrame)
+local function OnRefreshLoadoutOptionsInner(talentsFrame)
     if not talentsFrame or not talentsFrame.LoadSystem then return end
     if talentsFrame.IsInspecting and talentsFrame:IsInspecting() then return end
     if InCombatLockdown and InCombatLockdown() then return end
@@ -815,63 +835,192 @@ local function OnRefreshLoadoutOptions(talentsFrame)
     if not ns.ArraysEqual(currentSelections, sorted) then
         ns.SortInPlace(loadSystem.possibleSelections, sorted);
         local dropdown = loadSystem.GetDropdown and loadSystem:GetDropdown();
-        if dropdown and dropdown.IsMenuOpen and dropdown:IsMenuOpen() and dropdown.GenerateMenu then
+        if dropdown and dropdown.IsMenuOpen and dropdown:IsMenuOpen() and dropdown.GenerateMenu
+            and not isDragging and not potentialDrag then
             dropdown:GenerateMenu();
         end
     end
 end
 
-local function OnSetSelectionOptions(loadSystem, possibleSelections)
-    local talentsFrame = GetTalentsFrame();
-    if not talentsFrame or (talentsFrame.IsInspecting and talentsFrame:IsInspecting()) then return end
-    if InCombatLockdown and InCombatLockdown() then return end
+local function OnRefreshLoadoutOptions(talentsFrame)
+    -- Fail-open: never break Blizzard's execution chain from a secure hook.
+    SafeInvoke("refresh", OnRefreshLoadoutOptionsInner, talentsFrame);
+end
+ns.OnRefreshLoadoutOptions = OnRefreshLoadoutOptions;
 
-    local specID = ns.GetSpecID(talentsFrame);
-    if not specID or not loadSystem.possibleSelections or #loadSystem.possibleSelections <= 1 then return end
+-- ----------------------------------------------------------------------------
+-- Reconciliation (event-driven; WoW 12.x taint rules)
+-- ----------------------------------------------------------------------------
+-- The addon contains ZERO secure hooks and never installs scripts or fields on Blizzard
+-- frames (12.x Forbidden Aspects such as UntrustedScriptExecution can silently disable
+-- addon-installed handlers on flagged frames, and taint we add to Blizzard execution
+-- degrades restricted APIs like C_ClassTalents.GetConfigIDsBySpecID, which then returns
+-- {} and collapses the loadout list).
+--
+-- In-game it was verified that restricted talent APIs still work from addon execution
+-- even while Blizzard's own population came back degraded. The addon therefore
+-- reconciles the dropdown from its own execution on the same events Blizzard uses for
+-- loadout changes (TRAIT_CONFIG_LIST_UPDATED / TRAIT_CONFIG_CREATED / DELETED,
+-- ACTIVE_PLAYER_SPECIALIZATION_CHANGED, PLAYER_ENTERING_WORLD) plus bounded checks
+-- after login -- never by continuous polling. Reconciliation restores any missing
+-- loadouts (merge-only: entries injected by other addons are never removed) and applies
+-- the saved order at the data level, which menu generation tolerates by design.
 
-    local configIDToName = ns.GetConfigIDToName(talentsFrame, loadSystem.possibleSelections);
-    local sorted = ns.SortConfigIDs(specID, loadSystem.possibleSelections, configIDToName);
-    if not ns.ArraysEqual(loadSystem.possibleSelections, sorted) then
-        ns.SortInPlace(loadSystem.possibleSelections, sorted);
-        local dropdown = loadSystem.GetDropdown and loadSystem:GetDropdown();
-        if dropdown and dropdown.IsMenuOpen and dropdown:IsMenuOpen() and dropdown.GenerateMenu then
-            dropdown:GenerateMenu();
-        end
+local reconcilePending = false;
+local ScheduleReconcile; -- forward declaration (used by ReconcileInner deferral)
+
+local function RepopulateLoadoutOptionsInner(talentsFrame, missingIDs)
+    local loadSystem = talentsFrame.LoadSystem;
+    local current = loadSystem.possibleSelections or {};
+
+    -- Merge-only: keep every entry currently present, append the missing ground truth.
+    local merged = {};
+    for i, id in ipairs(current) do merged[i] = id; end
+    for _, id in ipairs(missingIDs) do
+        table.insert(merged, id);
     end
+
+    -- Name resolution: Blizzard's frame cache first, C_Traits from addon context as fallback.
+    local baseNames = ns.GetConfigIDToName(talentsFrame, merged);
+    local function nameTranslation(configID)
+        local name = baseNames[configID];
+        if name then return name; end
+        local ok, info = pcall(C_Traits and C_Traits.GetConfigInfo, configID);
+        return (ok and info and info.name) or "";
+    end
+
+    loadSystem:SetSelectionOptions(merged, nameTranslation, loadSystem.selectionColor, loadSystem.tooltipTranslation);
 end
 
-InitializeTalentHooks = function()
-    if hooksInstalled then return end
+local function ReconcileInner()
+    -- Never rebuild anything mid-drag: a SetSelectionOptions-driven regeneration would
+    -- release the open menu and cancel an in-progress drag (phantom release bug).
+    if isDragging or potentialDrag then
+        ScheduleReconcile();
+        return;
+    end
 
     local talentsFrame = GetTalentsFrame();
     if not talentsFrame or not talentsFrame.LoadSystem then return end
+    if talentsFrame.IsInspecting and talentsFrame:IsInspecting() then return end
+    if InCombatLockdown and InCombatLockdown() then return end
 
-    hooksInstalled = true;
-
-    if hooksecurefunc then
-        hooksecurefunc(talentsFrame, "RefreshLoadoutOptions", OnRefreshLoadoutOptions);
-        hooksecurefunc(talentsFrame.LoadSystem, "SetSelectionOptions", OnSetSelectionOptions);
-    end
-
-    -- Hook Dropdown menu close callback to cancel any active drag
     local loadSystem = talentsFrame.LoadSystem;
-    local dropdown = loadSystem.GetDropdown and loadSystem:GetDropdown();
-    if dropdown and dropdown.RegisterCallback then
-        local onMenuCloseEvent = (DropdownButtonMixin and DropdownButtonMixin.Event and DropdownButtonMixin.Event.OnMenuClose) or "OnMenuClose";
-        pcall(dropdown.RegisterCallback, dropdown, onMenuCloseEvent, function()
-            ns.CancelDrag();
-            ns.ClearActiveButtons();
-        end);
+    local current = loadSystem.possibleSelections;
+    if not current then return end
+
+    -- Ground truth from addon execution (restricted APIs work there).
+    local specID = ns.GetSpecID(talentsFrame);
+    local groundIDs = nil;
+    if specID and C_ClassTalents and C_ClassTalents.GetConfigIDsBySpecID then
+        local ok, ids = pcall(C_ClassTalents.GetConfigIDsBySpecID, specID);
+        if ok and type(ids) == "table" then
+            groundIDs = ids;
+        end
     end
 
-    -- Apply initial sort if options already exist
-    if loadSystem and loadSystem.possibleSelections and #loadSystem.possibleSelections > 1 then
+    -- Degraded population: find loadouts missing from the dropdown.
+    local missing = {};
+    if groundIDs then
+        local present = {};
+        for _, id in ipairs(current) do present[id] = true; end
+        for _, id in ipairs(groundIDs) do
+            if not present[id] then
+                table.insert(missing, id);
+            end
+        end
+    end
+
+    if #missing > 0 then
+        RepopulateLoadoutOptionsInner(talentsFrame, missing);
+    end
+
+    -- Apply the saved order to the (possibly restored) list.
+    local after = loadSystem.possibleSelections;
+    if after and #after > 1 then
         OnRefreshLoadoutOptions(talentsFrame);
+        DebugNote("reconcile", ("selections=[%s], missing restored=%d")
+            :format(table.concat(after, ","), #missing));
     end
 end
 
+ns.Reconcile = function()
+    SafeInvoke("reconcile", ReconcileInner);
+end
+
+ScheduleReconcile = function()
+    if reconcilePending then return end
+    reconcilePending = true;
+    if C_Timer and C_Timer.After then
+        C_Timer.After(0.25, function()
+            reconcilePending = false;
+            ns.Reconcile();
+        end);
+    else
+        reconcilePending = false;
+        ns.Reconcile();
+    end
+end
+
+ns.ScheduleReconcile = ScheduleReconcile;
+
+local function InitializeTalentHooksInner()
+    local talentsFrame = GetTalentsFrame();
+    if not talentsFrame or not talentsFrame.LoadSystem then
+        DebugNote("initHooks", "deferred: talent frame or LoadSystem not found yet");
+        return
+    end
+
+    hooksInstalled = true;
+
+    -- IMPORTANT (WoW 12.1+ taint rules): the addon contains ZERO secure hooks.
+    -- Hooking a Blizzard Lua method injects addon taint into Blizzard's execution, and even
+    -- hooking a SecretArguments-protected C function (C_ClassTalents.GetConfigIDsBySpecID)
+    -- was observed in-game to degrade its results: Blizzard's own calls then return empty
+    -- and the loadout list collapses to nothing. The addon therefore only ever:
+    --   * registers via Menu.ModifyMenu (the sanctioned customization API), and
+    --   * mutates loadout DATA (possibleSelections) from its own execution (the poller).
+    -- Sorting is handled by the OnUpdate poller and the initial sort below.
+
+    -- Self-test: what does the restricted API return from pure addon execution?
+    -- (Repeated a few times after login; no hooks involved.)
+    if C_Timer and C_Timer.After then
+        local selfTestAttempt = 0;
+        local function RunSelfTest()
+            selfTestAttempt = selfTestAttempt + 1;
+            local specID = PlayerUtil and PlayerUtil.GetCurrentSpecID and PlayerUtil.GetCurrentSpecID();
+            if specID and C_ClassTalents and C_ClassTalents.GetConfigIDsBySpecID then
+                local ok, ids = pcall(C_ClassTalents.GetConfigIDsBySpecID, specID);
+                local detail = ok and type(ids) == "table" and ("n=" .. #ids .. " [" .. table.concat(ids, ",") .. "]") or tostring(ids);
+                DebugNote("selfTest", ("attempt %d, spec=%s, ok=%s, %s")
+                    :format(selfTestAttempt, tostring(specID), tostring(ok), detail));
+            end
+            if selfTestAttempt < 3 then
+                C_Timer.After(8, RunSelfTest);
+            end
+        end
+        C_Timer.After(8, RunSelfTest);
+    end
+
+    -- Apply initial sort if options already exist
+    local loadSystem = talentsFrame.LoadSystem;
+    if loadSystem and loadSystem.possibleSelections and #loadSystem.possibleSelections > 1 then
+        OnRefreshLoadoutOptions(talentsFrame);
+    end
+
+    DebugNote("initHooks", "installed: configID probe + self-test (no Lua-method hooks)");
+end
+
+-- Assign the forward-declared local (captured by OnModifyTalentMenuInner); do not shadow it.
+InitializeTalentHooks = function()
+    if hooksInstalled then return end
+
+    diag.initAttempts = (diag.initAttempts or 0) + 1;
+    -- Fail-open: hook installation must never raise into Blizzard's load flow.
+    SafeInvoke("initHooks", InitializeTalentHooksInner);
+end
+
 ns.InitializeTalentHooks = InitializeTalentHooks;
-ns.OnRefreshLoadoutOptions = OnRefreshLoadoutOptions;
 
 -- ----------------------------------------------------------------------------
 -- Core Event Controller Frame
@@ -886,40 +1035,74 @@ local function IsAddOnLoadedSafe(addonName)
     return false;
 end
 
+local movementTriggerArmed = false;
 local eventFrame = CreateFrame("Frame", "ReorderTalentLoadoutsEventFrame");
 eventFrame:RegisterEvent("ADDON_LOADED");
 eventFrame:RegisterEvent("PLAYER_LOGIN");
+eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD");
 eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED");
 eventFrame:RegisterEvent("GLOBAL_MOUSE_DOWN");
 eventFrame:RegisterEvent("GLOBAL_MOUSE_UP");
+-- The same events Blizzard's ClassTalentFrame uses to drive the loadout dropdown.
+eventFrame:RegisterEvent("TRAIT_CONFIG_LIST_UPDATED");
+eventFrame:RegisterEvent("TRAIT_CONFIG_CREATED");
+eventFrame:RegisterEvent("TRAIT_CONFIG_DELETED");
+eventFrame:RegisterEvent("ACTIVE_PLAYER_SPECIALIZATION_CHANGED");
 
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
             ReorderTalentLoadoutsDB = ReorderTalentLoadoutsDB or {};
+            -- Keep last session's diagnostics for /rtl debug, but start fresh capture.
+            ReorderTalentLoadoutsDebug.last = { errors = ReorderTalentLoadoutsDebug.errors, log = ReorderTalentLoadoutsDebug.log };
+            ReorderTalentLoadoutsDebug.errors = {};
+            ReorderTalentLoadoutsDebug.log = {};
             if IsAddOnLoadedSafe("Blizzard_PlayerSpells") or IsAddOnLoadedSafe("Blizzard_ClassTalentUI") then
                 InitializeTalentHooks();
             end
         elseif arg1 == "Blizzard_PlayerSpells" or arg1 == "Blizzard_ClassTalentUI" then
             InitializeTalentHooks();
         end
-    elseif event == "PLAYER_LOGIN" then
+    elseif event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" then
         ReorderTalentLoadoutsDB = ReorderTalentLoadoutsDB or {};
         if IsAddOnLoadedSafe("Blizzard_PlayerSpells") or IsAddOnLoadedSafe("Blizzard_ClassTalentUI") then
             InitializeTalentHooks();
         end
+        if event == "PLAYER_LOGIN" then
+            -- Midnight: restricted-data predicates (CanPlayerUseTalentUI, talent config
+            -- reads, ...) stay pending right after a reload until the player's first real
+            -- input finalizes them -- pressing the talent keybind before that silently
+            -- no-ops. Reconcile at the moment of first movement (when the pane becomes
+            -- usable), with late bounded fallbacks for players who never move.
+            if not movementTriggerArmed then
+                movementTriggerArmed = true;
+                eventFrame:RegisterEvent("PLAYER_STARTED_MOVING");
+            end
+            for _, delay in ipairs({ 5, 15, 30 }) do
+                C_Timer.After(delay, ns.Reconcile);
+            end
+        else
+            ScheduleReconcile();
+        end
+    elseif event == "PLAYER_STARTED_MOVING" then
+        eventFrame:UnregisterEvent("PLAYER_STARTED_MOVING");
+        ns.Reconcile();
+    elseif event == "TRAIT_CONFIG_LIST_UPDATED" or event == "TRAIT_CONFIG_CREATED"
+        or event == "TRAIT_CONFIG_DELETED" or event == "ACTIVE_PLAYER_SPECIALIZATION_CHANGED" then
+        ScheduleReconcile();
     elseif event == "PLAYER_REGEN_DISABLED" then
         -- Cancel any drag operations when entering combat
         ns.CancelDrag();
     elseif event == "GLOBAL_MOUSE_DOWN" then
         local buttonName = arg1;
         if buttonName == "LeftButton" and not (InCombatLockdown and InCombatLockdown()) then
-            for _, btn in ipairs(activeLoadoutButtons) do
-                if btn:IsShown() and btn.IsMouseOver and btn:IsMouseOver() then
+            for _, entry in ipairs(trackedButtons) do
+                local btn = entry.button;
+                if btn.IsShown and btn:IsShown() and btn.IsMouseOver and btn:IsMouseOver() then
                     if not IsMouseOverUtilityButton(btn) then
                         potentialDrag = true;
                         dragSourceButton = btn;
-                        dragSourceConfigID = btn.rtLoadoutConfigID;
+                        dragSourceConfigID = entry.configID;
                         dragStartX, dragStartY = GetCursorPosition();
                     end
                     break;
@@ -936,6 +1119,8 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
 end);
 
 eventFrame:SetScript("OnUpdate", function(self, elapsed)
+    -- OnUpdate only services click-and-hold drag state; list reconciliation is event-driven.
+
     if potentialDrag and not isDragging then
         if IsMouseButtonDown and IsMouseButtonDown("LeftButton") then
             local curX, curY = GetCursorPosition();
@@ -960,9 +1145,11 @@ eventFrame:SetScript("OnUpdate", function(self, elapsed)
     end
 end);
 
--- Register with Blizzard Menu framework (available in 11.0+)
+-- Register with Blizzard Menu framework (available in 11.0+).
+-- The returned handle allows live unregistration for in-game bisecting (/rtl nomenu, /rtl menu).
+local menuModifyHandle;
 if Menu and Menu.ModifyMenu then
-    Menu.ModifyMenu("MENU_CLASS_TALENT_PROFILE", OnModifyTalentMenu);
+    menuModifyHandle = Menu.ModifyMenu("MENU_CLASS_TALENT_PROFILE", OnModifyTalentMenu);
 end
 
 -- ----------------------------------------------------------------------------
@@ -974,7 +1161,78 @@ SLASH_REORDERTALENTLOADOUTS2 = "/reordertalentloadouts";
 
 SlashCmdList["REORDERTALENTLOADOUTS"] = function(msg)
     local cmd = msg and string.lower(string.trim(msg)) or "";
-    if cmd == "reset" then
+    if cmd == "nomenu" or cmd == "menu" then
+        if DEFAULT_CHAT_FRAME then
+            if cmd == "nomenu" then
+                if menuModifyHandle then
+                    menuModifyHandle.Unregister(menuModifyHandle);
+                    menuModifyHandle = nil;
+                    diag.menuCallbacks = 0;
+                    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffReorder Talent Loadouts:|r menu callback unregistered (/rtl menu to re-enable).");
+                else
+                    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffReorder Talent Loadouts:|r menu callback already unregistered.");
+                end
+            else
+                if Menu and Menu.ModifyMenu and not menuModifyHandle then
+                    menuModifyHandle = Menu.ModifyMenu("MENU_CLASS_TALENT_PROFILE", OnModifyTalentMenu);
+                    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffReorder Talent Loadouts:|r menu callback re-registered (/rtl nomenu to disable).");
+                else
+                    DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffReorder Talent Loadouts:|r menu callback already registered.");
+                end
+            end
+        end
+    elseif cmd == "debug" then
+        if DEFAULT_CHAT_FRAME then
+            local function say(msg)
+                DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffRTL debug:|r " .. tostring(msg));
+            end
+            say("menu callback runs: " .. tostring(diag.menuCallbacks or 0) .. ", init attempts: " .. tostring(diag.initAttempts or 0));
+            say("initHooks: " .. tostring(diag.log.initHooks or "not run yet"));
+            say("menuCallback: " .. tostring(diag.log.menuCallback or "not run yet (open the loadout dropdown, then run /rtl debug again)"));
+            say("reconcile: " .. tostring(diag.log.reconcile or "not run yet"));
+            say("self-test (bounded, post-login): " .. tostring(diag.log.selfTest or "pending"));
+            if C_RestrictedActions and C_RestrictedActions.GetAddOnRestrictionState then
+                local okR, state = pcall(C_RestrictedActions.GetAddOnRestrictionState, ADDON_NAME);
+                say("addon restriction state: " .. (okR and tostring(state) or "query failed"));
+            end
+            local talentsFrame = GetTalentsFrame();
+            if talentsFrame and talentsFrame.LoadSystem then
+                local ps = talentsFrame.LoadSystem.possibleSelections;
+                say("talent frame found; possibleSelections=" .. (ps and ("{" .. table.concat(ps, ", ") .. "}") or "nil"));
+            else
+                say("talent frame NOT found (open the talents window once)");
+            end
+            local loadSystem = talentsFrame and talentsFrame.LoadSystem;
+            local dd = loadSystem and loadSystem.GetDropdown and loadSystem:GetDropdown();
+            if dd and dd.HasAnyForbiddenAspect then
+                local okF, has = pcall(dd.HasAnyForbiddenAspect, dd);
+                if okF and dd.GetForbiddenAspects then
+                    local okG, aspects = pcall(dd.GetForbiddenAspects, dd);
+                    say("dropdown forbidden aspects: has=" .. tostring(has)
+                        .. ", mask=" .. (okG and tostring(aspects) or "query failed"));
+                else
+                    say("dropdown forbidden aspects: has=" .. (okF and tostring(has) or "query failed"));
+                end
+            end
+            local specID = ns.GetSpecID(talentsFrame);
+            local saved = ns.GetSavedOrder(ns.GetPlayerKey(), specID);
+            say("saved order for spec " .. tostring(specID) .. ": " .. (saved and saved.order and ("{" .. table.concat(saved.order, ", ") .. "}") or "none"));
+            local errCount = 0;
+            for scope, err in pairs(diag.errors) do
+                errCount = errCount + 1;
+                say(("|cffff3333error [%s]:|r %s"):format(tostring(scope), (string.gsub(tostring(err), "\n", " | "))));
+            end
+            if errCount == 0 then
+                say("no captured errors this session");
+            end
+            if diag.last and diag.last.errors and next(diag.last.errors) then
+                say("|cffffaaaaerrors from previous session:|r");
+                for scope, err in pairs(diag.last.errors) do
+                    say(("|cffff3333prev [%s]:|r %s"):format(tostring(scope), (string.gsub(tostring(err), "\n", " | "))));
+                end
+            end
+        end
+    elseif cmd == "reset" then
         local talentsFrame = GetTalentsFrame();
         local specID = ns.GetSpecID(talentsFrame);
         local playerKey = ns.GetPlayerKey();
@@ -982,14 +1240,28 @@ SlashCmdList["REORDERTALENTLOADOUTS"] = function(msg)
             if ReorderTalentLoadoutsDB[playerKey] then
                 ReorderTalentLoadoutsDB[playerKey][specID] = nil;
             end
-            if talentsFrame and talentsFrame.RefreshLoadoutOptions then
-                talentsFrame:RefreshLoadoutOptions();
-            end
+
+            -- IMPORTANT (WoW 12.1+ taint rules): never call the frame's RefreshLoadoutOptions method
+            -- from addon execution; its body invokes the restricted C_ClassTalents.GetConfigIDsBySpecID
+            -- and errors under tainted execution. Re-run the pure-Lua load system replica instead,
+            -- which restores Blizzard's default order without touching restricted APIs.
             local loadSystem = talentsFrame and talentsFrame.LoadSystem;
-            local dropdown = loadSystem and loadSystem.GetDropdown and loadSystem:GetDropdown();
-            if dropdown and dropdown.IsMenuOpen and dropdown:IsMenuOpen() and dropdown.GenerateMenu then
-                dropdown:GenerateMenu();
+            if loadSystem and talentsFrame.configIDs and loadSystem.SetSelectionOptions then
+                local function nameTranslation(configID)
+                    return talentsFrame.configIDToName and talentsFrame.configIDToName[configID];
+                end
+                local function tooltipTranslation(configID)
+                    if talentsFrame.IsStarterBuildConfig and talentsFrame:IsStarterBuildConfig(configID) then
+                        if YELLOW_FONT_COLOR and TALENT_FRAME_DROP_DOWN_STARTER_BUILD_TOOLTIP then
+                            return YELLOW_FONT_COLOR:WrapTextInColorCode(TALENT_FRAME_DROP_DOWN_STARTER_BUILD_TOOLTIP);
+                        end
+                        return TALENT_FRAME_DROP_DOWN_STARTER_BUILD_TOOLTIP;
+                    end
+                    return nil;
+                end
+                loadSystem:SetSelectionOptions(talentsFrame.configIDs, nameTranslation, NORMAL_FONT_COLOR, tooltipTranslation);
             end
+
             if DEFAULT_CHAT_FRAME then
                 DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffReorder Talent Loadouts:|r Loadout order reset to default for this spec.");
             end

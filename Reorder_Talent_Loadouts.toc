@@ -2,8 +2,8 @@
 ## Title: Reorder Talent Loadouts
 ## Notes: Reorder talent loadouts by simply click-and-holding and moving them in the loadout dropdown.
 ## Author: Railander
-## Version: 1.0.1
-## SavedVariables: ReorderTalentLoadoutsDB
+## Version: 1.3.0
+## SavedVariables: ReorderTalentLoadoutsDB, ReorderTalentLoadoutsDebug
 ## OptionalDeps: Blizzard_PlayerSpells, Blizzard_ClassTalentUI
 ## IconTexture: Interface\Icons\INV_Misc_Book_09
 ## Category-enUS: Class & Talents
