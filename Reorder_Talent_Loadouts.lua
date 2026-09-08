@@ -964,6 +964,110 @@ end
 
 ns.ScheduleReconcile = ScheduleReconcile;
 
+-- Resets the current spec's saved order and restores Blizzard's default order in the
+-- dropdown. IMPORTANT (WoW 12.x taint rules): never call the frame's RefreshLoadoutOptions
+-- method from addon execution; its body invokes the restricted
+-- C_ClassTalents.GetConfigIDsBySpecID. The pure-Lua load system replica below is safe.
+function ns.ResetCurrentSpecOrder(announce)
+    local talentsFrame = GetTalentsFrame();
+    local specID = ns.GetSpecID(talentsFrame);
+    local playerKey = ns.GetPlayerKey();
+    if not playerKey or not specID then return false; end
+
+    if ReorderTalentLoadoutsDB[playerKey] then
+        ReorderTalentLoadoutsDB[playerKey][specID] = nil;
+    end
+
+    local loadSystem = talentsFrame and talentsFrame.LoadSystem;
+    if loadSystem and talentsFrame.configIDs and loadSystem.SetSelectionOptions then
+        local function nameTranslation(configID)
+            return talentsFrame.configIDToName and talentsFrame.configIDToName[configID];
+        end
+        local function tooltipTranslation(configID)
+            if talentsFrame.IsStarterBuildConfig and talentsFrame:IsStarterBuildConfig(configID) then
+                if YELLOW_FONT_COLOR and YELLOW_FONT_COLOR.WrapTextInColorCode and TALENT_FRAME_DROP_DOWN_STARTER_BUILD_TOOLTIP then
+                    return YELLOW_FONT_COLOR:WrapTextInColorCode(TALENT_FRAME_DROP_DOWN_STARTER_BUILD_TOOLTIP);
+                end
+                return TALENT_FRAME_DROP_DOWN_STARTER_BUILD_TOOLTIP;
+            end
+            return nil;
+        end
+        loadSystem:SetSelectionOptions(talentsFrame.configIDs, nameTranslation, NORMAL_FONT_COLOR, tooltipTranslation);
+    end
+
+    -- talentsFrame.configIDs may be stale/degraded (Blizzard's population); reconciliation
+    -- merges in the ground truth right away and leaves the default (unsorted) order intact.
+    ns.Reconcile();
+
+    if announce and DEFAULT_CHAT_FRAME then
+        DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffReorder Talent Loadouts:|r Loadout order reset to default for this spec.");
+    end
+    return true;
+end
+
+local resetButton = nil;
+
+-- Icon button styled after the talents pane's "Undo Pending Changes" button
+-- (IconButtonTemplate + talents-button-undo), shown only while the loadout dropdown is open.
+local function CreateResetButton(talentsFrame)
+    if resetButton or not CreateFrame then
+        return nil;
+    end
+
+    local loadSystem = talentsFrame.LoadSystem;
+    local dropdown = loadSystem.GetDropdown and loadSystem:GetDropdown();
+    if not dropdown then return nil; end
+
+    local btn = CreateFrame("Button", "ReorderTalentLoadoutsResetButton", dropdown:GetParent() or dropdown, "IconButtonTemplate");
+    btn:SetSize(25, 25);
+    if btn.SetAtlas then
+        btn:SetAtlas("talents-button-undo", true);
+    end
+    if btn.SetHighlightAtlas then
+        btn:SetHighlightAtlas("talents-button-undo", "ADD");
+        if btn.GetHighlightTexture then
+            local highlight = btn:GetHighlightTexture();
+            highlight:SetPoint("TOPLEFT", btn.Icon, "TOPLEFT");
+            highlight:SetPoint("BOTTOMRIGHT", btn.Icon, "BOTTOMRIGHT");
+        end
+    end
+    btn:SetPoint("RIGHT", dropdown, "LEFT", -6, 0);
+    btn:Hide();
+
+    if btn.SetOnClickHandler then
+        btn:SetOnClickHandler(function()
+            ns.ResetCurrentSpecOrder(true);
+        end);
+    else
+        btn:SetScript("OnClick", function() ns.ResetCurrentSpecOrder(true); end);
+    end
+
+    -- Tooltip (own button; plain script is fine here)
+    btn:SetScript("OnEnter", function(self)
+        if GameTooltip then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT");
+            GameTooltip:SetText("Reset Loadout Order", 1, 0.82, 0);
+            GameTooltip:AddLine("Restores this specialization's loadout order to the default.", 1, 1, 1, true);
+            GameTooltip:Show();
+        end
+    end);
+    btn:SetScript("OnLeave", function()
+        if GameTooltip then GameTooltip:Hide(); end
+    end);
+
+    -- Show only while the loadout dropdown's menu is open (sanctioned pub-sub callbacks).
+    if dropdown.RegisterCallback and DropdownButtonMixin and DropdownButtonMixin.Event then
+        pcall(dropdown.RegisterCallback, dropdown, DropdownButtonMixin.Event.OnMenuOpen, function()
+            btn:Show();
+        end);
+        pcall(dropdown.RegisterCallback, dropdown, DropdownButtonMixin.Event.OnMenuClose, function()
+            btn:Hide();
+        end);
+    end
+
+    return btn;
+end
+
 local function InitializeTalentHooksInner()
     local talentsFrame = GetTalentsFrame();
     if not talentsFrame or not talentsFrame.LoadSystem then
@@ -1008,7 +1112,10 @@ local function InitializeTalentHooksInner()
         OnRefreshLoadoutOptions(talentsFrame);
     end
 
-    DebugNote("initHooks", "installed: configID probe + self-test (no Lua-method hooks)");
+    -- Reset-order button (undo-arrow icon), visible only while the dropdown is open.
+    resetButton = CreateResetButton(talentsFrame) or resetButton;
+
+    DebugNote("initHooks", "installed: reconciler + reset button + self-test (no secure hooks)");
 end
 
 -- Assign the forward-declared local (captured by OnModifyTalentMenuInner); do not shadow it.
@@ -1233,39 +1340,7 @@ SlashCmdList["REORDERTALENTLOADOUTS"] = function(msg)
             end
         end
     elseif cmd == "reset" then
-        local talentsFrame = GetTalentsFrame();
-        local specID = ns.GetSpecID(talentsFrame);
-        local playerKey = ns.GetPlayerKey();
-        if playerKey and specID then
-            if ReorderTalentLoadoutsDB[playerKey] then
-                ReorderTalentLoadoutsDB[playerKey][specID] = nil;
-            end
-
-            -- IMPORTANT (WoW 12.1+ taint rules): never call the frame's RefreshLoadoutOptions method
-            -- from addon execution; its body invokes the restricted C_ClassTalents.GetConfigIDsBySpecID
-            -- and errors under tainted execution. Re-run the pure-Lua load system replica instead,
-            -- which restores Blizzard's default order without touching restricted APIs.
-            local loadSystem = talentsFrame and talentsFrame.LoadSystem;
-            if loadSystem and talentsFrame.configIDs and loadSystem.SetSelectionOptions then
-                local function nameTranslation(configID)
-                    return talentsFrame.configIDToName and talentsFrame.configIDToName[configID];
-                end
-                local function tooltipTranslation(configID)
-                    if talentsFrame.IsStarterBuildConfig and talentsFrame:IsStarterBuildConfig(configID) then
-                        if YELLOW_FONT_COLOR and TALENT_FRAME_DROP_DOWN_STARTER_BUILD_TOOLTIP then
-                            return YELLOW_FONT_COLOR:WrapTextInColorCode(TALENT_FRAME_DROP_DOWN_STARTER_BUILD_TOOLTIP);
-                        end
-                        return TALENT_FRAME_DROP_DOWN_STARTER_BUILD_TOOLTIP;
-                    end
-                    return nil;
-                end
-                loadSystem:SetSelectionOptions(talentsFrame.configIDs, nameTranslation, NORMAL_FONT_COLOR, tooltipTranslation);
-            end
-
-            if DEFAULT_CHAT_FRAME then
-                DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffReorder Talent Loadouts:|r Loadout order reset to default for this spec.");
-            end
-        end
+        ns.ResetCurrentSpecOrder(true);
     else
         if DEFAULT_CHAT_FRAME then
             DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffReorder Talent Loadouts:|r Click and hold any loadout in the talent dropdown to drag it into a new position. Use |cffffd100/rtl reset|r to reset the current spec's order.");
