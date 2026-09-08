@@ -1467,6 +1467,45 @@ do
         "No slash commands remain in the addon")
 end
 
+-- Test 42: talent pane OnShow reconciles the saved order before the first dropdown open
+do
+    local pKey = addonNamespace.GetPlayerKey()
+    local specID = 280
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 802, 801 } }
+
+    local paneShownCallbacks = {}
+    local mockPane = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        configIDToName = { [801] = "A", [802] = "B" },
+        configIDs = { 801, 802 },
+        HookScript = function(self, script, hook)
+            paneShownCallbacks[#paneShownCallbacks + 1] = hook
+        end,
+        LoadSystem = {
+            possibleSelections = { 801, 802 },
+            dropdown = { IsMenuOpen = function() return false end, GetParent = function() return nil end },
+            GetDropdown = function(self) return self.dropdown end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = mockPane }
+
+    addonNamespace._ResetHookStateForTest()
+    addonNamespace.InitializeTalentHooks()
+    assert_true(#paneShownCallbacks == 1, "OnShow post-hook installed on the talent pane")
+
+    -- Simulate the pane becoming visible after a reload: reconcile sorts the data before
+    -- the user can open the dropdown, so the first paint already uses the saved order.
+    paneShownCallbacks[1](mockPane)
+
+    assert_table_eq(mockPane.LoadSystem.possibleSelections, { 802, 801 },
+        "OnShow reconcile applies the saved order before the first dropdown open")
+
+    PlayerSpellsFrame = savedPSF
+end
+
 print(string.format("\nTest Results: %d Passed, %d Failed", passed, failed))
 if failed > 0 then
     os.exit(1)

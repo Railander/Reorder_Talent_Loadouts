@@ -780,6 +780,7 @@ end
 -- ----------------------------------------------------------------------------
 
 local hooksInstalled = false;
+local showHookInstalled = false;
 
 local function OnRefreshLoadoutOptionsInner(talentsFrame)
     if not talentsFrame or not talentsFrame.LoadSystem then return end
@@ -1121,6 +1122,19 @@ local function InitializeTalentHooksInner()
 
     -- Reset-order button (undo-arrow icon), visible only while the dropdown is open.
     resetButton = CreateResetButton(talentsFrame) or resetButton;
+
+    -- Reconcile the moment the talent pane becomes visible. Without this, the first
+    -- dropdown open after a reload shows Blizzard's default order: the pane's first
+    -- population fires no TRAIT_CONFIG event we can react to, and our menu callback can
+    -- only sort data that the description being generated has already consumed. OnShow
+    -- runs after that population and before any human can open the dropdown, so the
+    -- first paint already uses the saved order.
+    if talentsFrame.HookScript and not showHookInstalled then
+        showHookInstalled = true;
+        talentsFrame:HookScript("OnShow", function()
+            ns.Reconcile();
+        end);
+    end
 end
 
 -- Assign the forward-declared local (captured by OnModifyTalentMenuInner); do not shadow it.
@@ -1132,6 +1146,10 @@ InitializeTalentHooks = function()
 end
 
 ns.InitializeTalentHooks = InitializeTalentHooks;
+ns._ResetHookStateForTest = function() -- private-suite seam: re-run installation
+    hooksInstalled = false;
+    showHookInstalled = false;
+end
 
 -- ----------------------------------------------------------------------------
 -- Core Event Controller Frame
