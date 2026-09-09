@@ -1,14 +1,14 @@
 --[[
     12.1 Integration Simulation for Reorder Talent Loadouts.
     Loads the REAL Blizzard 12.1 menu framework (SecureTypes, ProxyUtil, Menu, DropdownButton,
-    MenuUtil, MenuTemplates, LoadSystemTemplates) from BlizzardInterfaceCode, plus the addon,
+    MenuUtil, MenuTemplates, LoadSystemTemplates) from the WoW_UI_Source/12.1 dump, plus the addon,
     then simulates: talent frame init -> RefreshLoadoutOptions -> GenerateMenu (menu open)
     -> our MENU_CLASS_TALENT_PROFILE callback -> drop -> regenerate.
     Any runtime error in that chain reproduces "dropdown shows nothing" in-game.
     Run with: lua tests/sim_12_1.lua
 --]]
 
-local BIC = "BlizzardInterfaceCode/Interface/AddOns/";
+local BIC = "../WoW_UI_Source/12.1/Interface/AddOns/";
 local PASS, FAIL = 0, 0;
 local function ok(cond, name, extra)
     if cond then PASS = PASS + 1; print("  PASS: " .. name);
