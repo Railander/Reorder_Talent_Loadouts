@@ -1594,7 +1594,7 @@ do
     PlayerSpellsFrame = savedPSF
 end
 
--- Test 46: drag refused while protected (one notice), allowed when clear
+-- Test 46: drag refused while protected (silently), allowed when clear
 do
     local evFrame = nil
     for _, f in ipairs(mockFrames) do
@@ -1611,9 +1611,9 @@ do
     inCombat = true
     addonNamespace.StartDrag(b)
     assert_true(b:GetAlpha() == 1.0, "drag refused while protected")
-    assert_true(#DEFAULT_CHAT_FRAME.messages == chatBase + 1, "blocked drag announces once")
+    assert_true(#DEFAULT_CHAT_FRAME.messages == chatBase, "blocked drag is silent (no chat in combat)")
     addonNamespace.StartDrag(b)
-    assert_true(#DEFAULT_CHAT_FRAME.messages == chatBase + 1, "repeat blocked drag stays silent")
+    assert_true(#DEFAULT_CHAT_FRAME.messages == chatBase, "repeat blocked drag stays silent")
 
     -- A press while protected must not even arm potentialDrag (OnUpdate early-outs)
     cursorX, cursorY = 100, 100
@@ -1626,7 +1626,7 @@ do
     addonNamespace.CancelDrag()
 
     inCombat = false
-    evFrame.scripts["OnEvent"](evFrame, "PLAYER_REGEN_ENABLED") -- lift: resets episode throttle
+    evFrame.scripts["OnEvent"](evFrame, "PLAYER_REGEN_ENABLED") -- lift resumes
     addonNamespace.StartDrag(b)
     assert_true(b:GetAlpha() == 0.35, "drag allowed once clear")
     addonNamespace.CancelDrag()
