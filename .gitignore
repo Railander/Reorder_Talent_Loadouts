@@ -13,9 +13,9 @@ secret*
 
 # EXCLUSIONARY BY DEFAULT (house rule -- see ../AGENTS.md): everything is
 # ignored unless explicitly allowed below. A new file that isn't allowlisted
-# stays invisible to `git status`. This repo has no remote and no packager
-# runs from it, so dev files are tracked intentionally -- but they are still
-# explicitly listed below, never swept in by a wildcard.
+# stays invisible to `git status`. No packager runs from this local dev repo
+# (releases run from the public repo), so dev files are tracked intentionally
+# -- but they are still explicitly listed below, never swept in by a wildcard.
 *
 !*/
 
@@ -29,7 +29,7 @@ secret*
 !preview.gif
 
 # NOT allowlisted: agent docs and suites stay ignored by default even in this
-# local-only dev repo (already-tracked copies are immune to ignore rules;
+# local dev repo (already-tracked copies are immune to ignore rules;
 # brand-new dev files need an explicit `!` line or `git add -f`). Public
 # clones must never track these -- see ../AGENTS.md.
 AGENTS.md
