@@ -72,7 +72,6 @@ local restrictionsActive = false;
 local restrictedTypes = {}; -- per-type marks from ADDON_RESTRICTION_STATE_CHANGED payloads
 local gatedInitDeferred = false;
 local reconcileQueued = false;
-local lockNoticeShown = false;
 
 -- ----------------------------------------------------------------------------
 -- Utility Functions
@@ -406,7 +405,6 @@ local function StartDragInner(button)
         return;
     end
     if ns.IsInteractionLocked() then
-        ns.NotifyLocked();
         return;
     end
 
@@ -1127,7 +1125,6 @@ local function CreateResetButton(talentsFrame)
     btn:SetScript("OnMouseDown", function(self, mouseButton)
         if mouseButton ~= "LeftButton" then return end
         if ns.IsInteractionLocked() then
-            ns.NotifyLocked();
             return;
         end
         if self.Icon then
@@ -1264,13 +1261,15 @@ end
 -- are all AllowedWhenUntainted. Safe while protected: Show/Hide (no gate
 -- annotation -- used for all visibility toggles), SetAlpha (AllowedWhenTainted),
 -- GetRect/GetCursorPosition, Menu.ModifyMenu + the menu-description proxy
--- whitelist, and chat AddMessage.
+-- whitelist. Chat AddMessage is equally gated -- and since notices neither
+-- render while locked nor get read in combat, the addon emits none at all.
 --
--- While locked: drags refuse with one throttled chat notice, reconcile/sort
--- requests queue instead of writing, the reset button hides; everything flushes
--- when protection lifts (ADDON_RESTRICTION_STATE_CHANGED, PLAYER_REGEN_ENABLED
--- backstop, login backstops, next talent event -- whichever confirms clear
--- outside dispatch first).
+-- While locked: drags silently refuse, reconcile/sort requests queue instead
+-- of writing, the reset button hides; everything flushes when protection
+-- lifts (ADDON_RESTRICTION_STATE_CHANGED, PLAYER_REGEN_ENABLED backstop, login
+-- backstops, next talent event -- whichever confirms clear outside dispatch
+-- first). No chat output exists on any lock path: notices neither render while
+-- protected nor get read in combat, so blocked input just does nothing.
 
 local RESTRICTION_TYPE_FALLBACK = { 0, 1, 2, 3, 4, 5 }; -- Combat, Encounter, ChallengeMode, PvPMatch, Map, Chat
 local RESTRICTION_STATE_FALLBACK = { inactive = 0, activating = 1, active = 2 };
@@ -1328,19 +1327,6 @@ function ns.IsInteractionLocked()
     return restrictionsActive or ns.AreRestrictionsActive();
 end
 
-local function AnnounceAddon(msg)
-    if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
-        DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffReorder Talent Loadouts:|r " .. msg);
-    end
-end
-
--- One notice per lock episode; further blocked gestures stay silent (no spam).
-function ns.NotifyLocked()
-    if lockNoticeShown then return end
-    lockNoticeShown = true;
-    AnnounceAddon("Loadout reordering is unavailable while protected (combat, Mythic+, or PvP) -- resumes automatically.");
-end
-
 local function ApplyRestrictionsActive()
     restrictionsActive = true;
     ns.CancelDrag();
@@ -1350,7 +1336,6 @@ end
 local function ApplyRestrictionsCleared()
     restrictionsActive = false;
     wipe(restrictedTypes);
-    lockNoticeShown = false;
     ns.EnsureGatedInit();
     if reconcileQueued then
         reconcileQueued = false;
@@ -1366,8 +1351,9 @@ local function ConfirmRestrictionsCleared()
     end
 end
 
--- Re-query and apply whichever side is true. Lock side is silent (the notice
--- fires on blocked gestures and on load-time deferral only -- never per fight).
+-- Re-query and apply whichever side is true. Both sides are silent: no chat
+-- output exists on any lock path (verified in game -- notices neither render
+-- while protected nor get read in combat, so blocked input just does nothing).
 -- Clear side is cheap when there is nothing to resume: only a lock episode, a
 -- deferred init, a queued reconcile, or a never-installed hook runs the full
 -- resume. Zone crossings fire often -- the common case is just the query.
@@ -1376,7 +1362,6 @@ local function RefreshRestrictionState()
         ApplyRestrictionsActive();
         return true;
     end
-    lockNoticeShown = false;
     if restrictionsActive or gatedInitDeferred or reconcileQueued or not hooksInstalled then
         ApplyRestrictionsCleared();
     elseif UpdateResetButton then
@@ -1447,7 +1432,7 @@ local function OnAddonEvent(self, event, arg1, arg2)
         end
     elseif event == "PLAYER_REGEN_DISABLED" then
         -- Entering combat: cancel drags immediately; mark locked only if the
-        -- query agrees (no chat here -- the notice fires on blocked gestures).
+        -- query agrees. The lock transition is silent by design.
         ns.CancelDrag();
         if ns.AreRestrictionsActive() then
             ApplyRestrictionsActive();
@@ -1566,14 +1551,11 @@ if Menu and Menu.ModifyMenu then
     Menu.ModifyMenu("MENU_CLASS_TALENT_PROFILE", OnModifyTalentMenu);
 end
 
--- Boot-time restriction evaluation: a /reload landing mid-protection defers all
--- gated setup (announced once -- AddMessage is safe while protected) instead of
--- half-installing hooks that would fail silently. Recovery order on lift:
--- restriction-changed confirm, regen-enabled, login backstops, next talent
--- event, next dropdown open.
+-- Boot-time restriction evaluation: a /reload landing mid-protection silently
+-- defers all gated setup instead of half-installing hooks that would fail
+-- silently. Recovery order on lift: restriction-changed confirm, regen-enabled,
+-- login backstops, next talent event, next dropdown open.
 SafeInvoke("bootstrap", function()
-    if not ns.EnsureGatedInit() then
-        AnnounceAddon("Setup deferred while protected (combat, Mythic+, or PvP) -- resumes automatically.");
-    end
+    ns.EnsureGatedInit();
 end);
 
