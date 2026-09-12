@@ -64,15 +64,6 @@ local currentDropTargetIndex = nil;
 local trackedButtons = {}; -- addon-side registry of loadout menu buttons: { button, configID }; never written onto Blizzard frames
 local UpdateResetButton; -- forward declaration: refreshes reset-button visibility (defined near the reset button)
 
--- Restriction-state variables (WoW 12.x). Declared HERE (not in the restriction
--- module below) because the drag/sort/menu paths above the module assign them;
--- Lua locals bind lexically, so a later `local` would leave those paths writing
--- to a same-named global instead.
-local restrictionsActive = false;
-local restrictedTypes = {}; -- per-type marks from ADDON_RESTRICTION_STATE_CHANGED payloads
-local gatedInitDeferred = false;
-local reconcileQueued = false;
-
 -- ----------------------------------------------------------------------------
 -- Utility Functions
 -- ----------------------------------------------------------------------------
@@ -404,9 +395,6 @@ local function StartDragInner(button)
     if isDragging or not button or not ns.FindTrackedEntry(button) then
         return;
     end
-    if ns.IsInteractionLocked() then
-        return;
-    end
 
     CreateUIElements();
 
@@ -451,7 +439,7 @@ local function UpdateDragInner()
     local firstBtn = trackedButtons[1].button;
     local lastBtn = trackedButtons[totalButtons].button;
     local bLeft, bBottom, bWidth, bHeight = firstBtn:GetRect();
-    local lastLeft, lastBottom, lastWidth, lastHeight = lastBtn:GetRect();
+    local lastBottom = select(2, lastBtn:GetRect());
     if not bLeft or not lastBottom then
         insertionLine:Hide();
         currentDropTargetIndex = nil;
@@ -473,7 +461,7 @@ local function UpdateDragInner()
     local targetIndex = totalButtons + 1;
     for i = 1, totalButtons do
         local btn = trackedButtons[i].button;
-        local left, bottom, width, height = btn:GetRect();
+        local left, bottom, _, height = btn:GetRect();
         if left and bottom and height then
             local midY = bottom + height / 2;
             if cursorY >= midY then
@@ -527,17 +515,6 @@ local function FinishDragInner()
 
     if dragSourceButton then
         dragSourceButton:SetAlpha(1.0);
-    end
-
-    -- Race guard: protection activated mid-drag (activation cancels drags, but a
-    -- release landing in the same frame still arrives here) -- visuals are
-    -- cleaned up above, then the gesture is dropped without persisting,
-    -- sounding, or regenerating anything.
-    if ns.IsInteractionLocked() then
-        dragSourceButton = nil;
-        dragSourceConfigID = nil;
-        currentDropTargetIndex = nil;
-        return;
     end
 
     if not wasDragging or not currentDropTargetIndex or not dragSourceConfigID then
@@ -686,18 +663,18 @@ function ns.SetupLoadoutButton(button, description, menu, configID)
         table.insert(trackedButtons, entry);
     end
 
-    -- While protected, leave the button as a plain Blizzard row: no drag arming,
-    -- no taint-able script installs. The registry entry above still tracks the
-    -- row, so a lift-while-open regenerates into full behavior on next open.
-    local installLocked = ns.IsInteractionLocked();
+    -- Menu buttons carry no secret-markable content (plain loadout rows, no
+    -- unit/combat/aura data), so the drag installs below serve under any
+    -- restriction state (same live-sealed model as the Move_* family: attempt
+    -- blindly on clean chrome, refusals error loudly instead of hiding).
     -- Drag UX hooks (post-hooks only; verified safe on menu item buttons).
-    if button.RegisterForDrag and not installLocked then
+    if button.RegisterForDrag then
         button:RegisterForDrag("LeftButton");
     end
-    if button.HookScript and not button.rtDragHooked and not installLocked then
+    if button.HookScript and not button.rtDragHooked then
         button.rtDragHooked = true;
         button:HookScript("OnMouseDown", function(self, mouseButton)
-            if mouseButton == "LeftButton" and not ns.IsInteractionLocked() then
+            if mouseButton == "LeftButton" then
                 if IsMouseOverUtilityButton(self) then
                     return;
                 end
@@ -718,9 +695,9 @@ function ns.SetupLoadoutButton(button, description, menu, configID)
             end
         end);
     end
-    if button.SetScript and not installLocked then
+    if button.SetScript then
         button:SetScript("OnDragStart", function(self)
-            if not ns.IsInteractionLocked() and not IsMouseOverUtilityButton(self) then
+            if not IsMouseOverUtilityButton(self) then
                 ns.StartDrag(self);
             end
         end);
@@ -759,15 +736,9 @@ local function OnModifyTalentMenuInner(ownerRegion, rootDescription, contextData
     end
 
     if InitializeTalentHooks then
-        -- Menu opened while protected: leave Blizzard's rows fully plain (still
-        -- selectable) and retry the queued work on lift. This callback is also
-        -- the self-heal for a /reload-in-combat: opening the dropdown after the
-        -- fight (re)runs the deferred gated setup via EnsureGatedInit.
-        if ns.IsInteractionLocked() then
-            reconcileQueued = true;
-            return;
-        end
-        ns.EnsureGatedInit();
+        -- Self-heal for late-loading talent UI: opening the dropdown after the
+        -- pane's addon loads (re)runs the idempotent setup above.
+        ns.EnsureInit();
     end
 
     local possibleSelections = loadSystem.possibleSelections or {};
@@ -794,7 +765,9 @@ local function OnModifyTalentMenuInner(ownerRegion, rootDescription, contextData
             local data = desc:GetData();
             if data and selectionSet[data] then
                 -- This description represents a loadout entry!
-                local ok = SafeInvoke("menu-element", function()
+                -- (SafeInvoke result deliberately unbound: failures report via
+                -- the fail-open scope above, the return value is never read.)
+                SafeInvoke("menu-element", function()
                     -- Suppress click selection during drag
                     desc:SetCanSelect(function()
                         if isDragging or justFinishedDragging then
@@ -854,10 +827,6 @@ local showHookInstalled = false;
 local function OnRefreshLoadoutOptionsInner(talentsFrame)
     if not talentsFrame or not talentsFrame.LoadSystem then return end
     if talentsFrame.IsInspecting and talentsFrame:IsInspecting() then return end
-    if ns.IsInteractionLocked() then
-        reconcileQueued = true;
-        return;
-    end
 
     local specID = ns.GetSpecID(talentsFrame);
     if not specID then return end
@@ -885,25 +854,38 @@ end
 ns.OnRefreshLoadoutOptions = OnRefreshLoadoutOptions;
 
 -- ----------------------------------------------------------------------------
--- Reconciliation (event-driven; WoW 12.x taint rules)
+-- Reconciliation (event-driven; WoW 12.x taint rules + restriction model)
 -- ----------------------------------------------------------------------------
 -- The addon contains ZERO secure hooks and never installs scripts or fields on Blizzard
 -- frames (12.x Forbidden Aspects such as UntrustedScriptExecution can silently disable
 -- addon-installed handlers on flagged frames, and taint we add to Blizzard execution
 -- degrades restricted APIs like C_ClassTalents.GetConfigIDsBySpecID, which then returns
--- {} and collapses the loadout list).
+-- {} and collapses the loadout list -- that collapse was TAINT, not restrictions: it
+-- reproduced at login with zero restriction types active and cleared the moment the
+-- Blizzard-Lua hook was removed (v1.3.0), with no restriction handling involved).
+--
+-- Restrictions (12.x) target unit/combat/aura data flowing through secrets into
+-- marked objects -- not wholesale execution bans (Blizzard 12.0: look-and-feel
+-- customization, "including combat-related UIs", is explicitly NOT the target).
+-- Nothing this addon touches can be secret-marked: menu buttons are plain loadout
+-- rows, config IDs are plain numbers, and no unit/combat/aura data is ingested --
+-- so every op below just attempts, blindly, under any restriction state (the
+-- Move_* live seal: full drags, settings, strata writes and installs serve clean
+-- under all six restriction types forced). A refusal errors LOUDLY through
+-- SafeInvoke (Bugsack) instead of hiding in a queue nobody reports.
 --
 -- In-game it was verified that restricted talent APIs still work from addon execution
 -- even while Blizzard's own population came back degraded. The addon therefore
 -- reconciles the dropdown from its own execution on the same events Blizzard uses for
 -- loadout changes (TRAIT_CONFIG_LIST_UPDATED / TRAIT_CONFIG_CREATED / DELETED,
 -- ACTIVE_PLAYER_SPECIALIZATION_CHANGED, PLAYER_ENTERING_WORLD, ZONE_CHANGED,
--- ZONE_CHANGED_NEW_AREA, ADDON_RESTRICTION_STATE_CHANGED, PLAYER_REGEN_ENABLED) plus bounded checks
--- after login -- never by continuous polling. While interaction-locked (any of the
--- six 12.x restriction types active) reconcile requests only queue; the queue
--- flushes on lift. Reconciliation restores any missing
--- loadouts (merge-only: entries injected by other addons are never removed) and applies
--- the saved order at the data level, which menu generation tolerates by design.
+-- ZONE_CHANGED_NEW_AREA) plus bounded checks after login -- never by continuous
+-- polling. Degraded reads need no lock discipline: an empty ground truth only
+-- skips the merge (merge-only: entries injected by other addons are never
+-- removed) while the saved order still applies to whatever is present -- and the
+-- next event retries organically. Reconciliation restores any missing
+-- loadouts and applies the saved order at the data level, which menu generation
+-- tolerates by design.
 
 local reconcilePending = false;
 local ScheduleReconcile; -- forward declaration (used by ReconcileInner deferral)
@@ -936,14 +918,6 @@ local function ReconcileInner()
     -- release the open menu and cancel an in-progress drag (phantom release bug).
     if isDragging or potentialDrag then
         ScheduleReconcile();
-        return;
-    end
-
-    -- While protected, queue instead of writing: ground-truth reads are gated
-    -- and dropdown writes must not touch taint-able elements. The queue flushes
-    -- on lift (restriction event, regen-enabled, login backstop, next event).
-    if ns.IsInteractionLocked() then
-        reconcileQueued = true;
         return;
     end
 
@@ -1068,12 +1042,6 @@ end
 
 UpdateResetButton = function()
     if not resetButton then return end
-    -- While protected the button stays hidden (no taint-able interaction); the
-    -- cosmetic press-depress normalize below is skipped too (SetPoint is gated).
-    if ns.IsInteractionLocked() then
-        resetButton:Hide();
-        return;
-    end
     -- The button hides at press, so its OnMouseUp (icon restore) never fires; normalize
     -- the press-depress offset whenever visibility is refreshed.
     if resetButton.Icon then
@@ -1124,9 +1092,6 @@ local function CreateResetButton(talentsFrame)
     -- next frame -- so the dropdown only ever flickers for at most a single frame.
     btn:SetScript("OnMouseDown", function(self, mouseButton)
         if mouseButton ~= "LeftButton" then return end
-        if ns.IsInteractionLocked() then
-            return;
-        end
         if self.Icon then
             self.Icon:SetPoint("CENTER", self, "CENTER", 1, -1); -- press-depress visual
         end
@@ -1135,9 +1100,9 @@ local function CreateResetButton(talentsFrame)
             ns.ResetCurrentSpecOrder(false);
             if C_Timer and C_Timer.After then
                 C_Timer.After(0, function()
-                    local talentsFrame = GetTalentsFrame();
-                    local loadSystem = talentsFrame and talentsFrame.LoadSystem;
-                    local dd = loadSystem and loadSystem.GetDropdown and loadSystem:GetDropdown();
+                    local tf = GetTalentsFrame();
+                    local ls = tf and tf.LoadSystem;
+                    local dd = ls and ls.GetDropdown and ls:GetDropdown();
                     if not ddOpen(dd) and dd and dd.OpenMenu then
                         dd:OpenMenu();
                     end
@@ -1198,12 +1163,14 @@ local function InitializeTalentHooksInner()
     hooksInstalled = true;
 
     -- IMPORTANT (WoW 12.x taint rules): the addon contains ZERO secure hooks. Hooking a
-    -- Blizzard Lua method injects addon taint into Blizzard's execution, and even hooking a
-    -- SecretArguments-protected C function (C_ClassTalents.GetConfigIDsBySpecID) was
-    -- observed in-game to degrade its results, collapsing the loadout list. The addon only
-    -- ever registers via Menu.ModifyMenu (the sanctioned customization API) and mutates
-    -- loadout DATA (possibleSelections) from its own execution. Reconciliation is
-    -- event-driven and the initial sort runs below.
+    -- Blizzard Lua method injects addon taint into Blizzard's execution, and the
+    -- restricted C APIs called on that tainted path then degrade (this is exactly
+    -- how the loadout list collapsed to Starter Build pre-v1.3.0: taint, with zero
+    -- restriction types active -- not restrictions). Secure-hooking a C function
+    -- is inert; the Lua-method hook was the vector, and both stay out regardless.
+    -- The addon only ever registers via Menu.ModifyMenu (the sanctioned
+    -- customization API) and mutates loadout DATA (possibleSelections) from its
+    -- own execution. Reconciliation is event-driven and the initial sort runs below.
 
     -- Apply initial sort if options already exist
     local loadSystem = talentsFrame.LoadSystem;
@@ -1243,151 +1210,27 @@ ns._ResetHookStateForTest = function() -- private-suite seam: re-run installatio
 end
 
 -- ----------------------------------------------------------------------------
--- Restriction State (WoW 12.x): lock taint-able interactions while protected
+-- Init (WoW 12.x): attempt everything, blindly, on clean chrome
 -- ----------------------------------------------------------------------------
--- Midnight gates tainted (addon) execution while ANY addon restriction is active
--- (Enum.AddOnRestrictionType: Combat, Encounter, ChallengeMode, PvPMatch, Map,
--- Chat -- six types; rated PvP and Mythic+ hold them essentially full-time, so
--- InCombatLockdown alone is the wrong check). While protected the addon must not
--- touch taint-able elements: no drag arming, no reset presses, no dropdown
--- writes, no gated setup -- and a /reload landing mid-protection must defer
--- setup instead of half-installing hooks that would fail silently.
---
--- Gate audit (vs Blizzard_APIDocumentationGenerated, 12.1 -- full table in
--- AGENTS.md): HookScript/SetScript, RegisterEvent/UnregisterEvent,
--- RegisterForDrag, SetPoint/SetSize/SetHeight, SetShown, PlaySound,
--- C_Timer.After, IsMouseButtonDown, C_ClassTalents.GetConfigIDsBySpecID,
--- C_Traits.GetConfigInfo and C_RestrictedActions.IsAddOnRestrictionActive itself
--- are all AllowedWhenUntainted. Safe while protected: Show/Hide (no gate
--- annotation -- used for all visibility toggles), SetAlpha (AllowedWhenTainted),
--- GetRect/GetCursorPosition, Menu.ModifyMenu + the menu-description proxy
--- whitelist. Chat AddMessage is equally gated -- and since notices neither
--- render while locked nor get read in combat, the addon emits none at all.
---
--- While locked: drags silently refuse, reconcile/sort requests queue instead
--- of writing, the reset button hides; everything flushes when protection
--- lifts (ADDON_RESTRICTION_STATE_CHANGED, PLAYER_REGEN_ENABLED backstop, login
--- backstops, next talent event -- whichever confirms clear outside dispatch
--- first). No chat output exists on any lock path: notices neither render while
--- protected nor get read in combat, so blocked input just does nothing.
-
-local RESTRICTION_TYPE_FALLBACK = { 0, 1, 2, 3, 4, 5 }; -- Combat, Encounter, ChallengeMode, PvPMatch, Map, Chat
-local RESTRICTION_STATE_FALLBACK = { inactive = 0, activating = 1, active = 2 };
-
-local function GetRestrictionTypeIDs()
-    if Enum and Enum.AddOnRestrictionType then
-        local t = Enum.AddOnRestrictionType;
-        local out = {};
-        for _, id in ipairs({ t.Combat, t.Encounter, t.ChallengeMode, t.PvPMatch, t.Map, t.Chat }) do
-            if id ~= nil then
-                table.insert(out, id);
-            end
-        end
-        if #out > 0 then
-            return out;
-        end
-    end
-    return RESTRICTION_TYPE_FALLBACK;
-end
-
-local function RestrictionStateID(name)
-    if Enum and Enum.AddOnRestrictionState and Enum.AddOnRestrictionState[name] ~= nil then
-        return Enum.AddOnRestrictionState[name];
-    end
-    return RESTRICTION_STATE_FALLBACK[name];
-end
+-- Midnight restriction flags are the RISK SIGNAL (secrets may be flowing), not
+-- the gate: enforcement bites only where secrets flowed into marked objects
+-- (unit/combat/aura data). Nothing here can be marked -- plain loadout rows,
+-- plain config-ID numbers, own frames -- so setup installs unconditionally,
+-- exactly like the Move_* family's live seal (installs, drags, writes serve
+-- clean under all six restriction types forced). If the engine ever refuses,
+-- it errors LOUDLY through SafeInvoke (Bugsack) instead of deferring into a
+-- queue nobody reports. The slash-less design needs no re-entry beyond the
+-- idempotent calls below (menu open, talent events, login).
 
 local RegisterAddonEvents; -- forward declaration: assigned after the event frame exists
 
--- Full all-types query. Must NEVER run during ADDON_RESTRICTION_STATE_CHANGED
--- dispatch (IsAddOnRestrictionActive reads false there by design); the event
--- handler below maintains per-type marks from the payload instead.
-function ns.AreRestrictionsActive()
-    if C_RestrictedActions and C_RestrictedActions.IsAddOnRestrictionActive then
-        for _, rtype in ipairs(GetRestrictionTypeIDs()) do
-            local ok, active = pcall(C_RestrictedActions.IsAddOnRestrictionActive, rtype);
-            if ok and active then
-                return true;
-            end
-        end
-        return false;
-    end
-    if InCombatLockdown then
-        return InCombatLockdown() and true or false;
-    end
-    return false;
-end
-
--- Live check: the flag covers dispatch windows where the query reads false by
--- design; the query covers events missed while a registration was down. Either
--- side locks. Callers are input/event-driven (never per-frame), so the handful
--- of pcall'd queries per gesture is negligible -- OnUpdate pre-filters on drag
--- state before asking.
-function ns.IsInteractionLocked()
-    return restrictionsActive or ns.AreRestrictionsActive();
-end
-
-local function ApplyRestrictionsActive()
-    restrictionsActive = true;
-    ns.CancelDrag();
-    if UpdateResetButton then UpdateResetButton(); end
-end
-
-local function ApplyRestrictionsCleared()
-    restrictionsActive = false;
-    wipe(restrictedTypes);
-    ns.EnsureGatedInit();
-    if reconcileQueued then
-        reconcileQueued = false;
-        ns.Reconcile();
-    end
-    if UpdateResetButton then UpdateResetButton(); end
-end
-
--- Re-query outside event dispatch; clears the lock only when every type is idle.
-local function ConfirmRestrictionsCleared()
-    if not ns.AreRestrictionsActive() then
-        ApplyRestrictionsCleared();
-    end
-end
-
--- Re-query and apply whichever side is true. Both sides are silent: no chat
--- output exists on any lock path (verified in game -- notices neither render
--- while protected nor get read in combat, so blocked input just does nothing).
--- Clear side is cheap when there is nothing to resume: only a lock episode, a
--- deferred init, a queued reconcile, or a never-installed hook runs the full
--- resume. Zone crossings fire often -- the common case is just the query.
-local function RefreshRestrictionState()
-    if ns.AreRestrictionsActive() then
-        ApplyRestrictionsActive();
-        return true;
-    end
-    if restrictionsActive or gatedInitDeferred or reconcileQueued or not hooksInstalled then
-        ApplyRestrictionsCleared();
-    elseif UpdateResetButton then
-        -- Already clear with nothing to resume (e.g. combat ended but no lock
-        -- episode was ever latched): the reset button may still need showing.
-        UpdateResetButton();
-    end
-    return false;
-end
-
--- Idempotent gated setup: (re)registers events and installs talent hooks. Safe
--- to call from any event or menu callback; defers (and remembers) while
--- protected so a /reload-in-combat never half-installs silently.
-function ns.EnsureGatedInit()
-    if ns.AreRestrictionsActive() then
-        gatedInitDeferred = true;
-        return false;
-    end
-    gatedInitDeferred = false;
+-- Idempotent setup: (re)registers events and installs talent hooks. Safe to
+-- call from any event or menu callback; re-registering is a no-op and hook
+-- installs run once (HookScript chains, so repeats would stack duplicates).
+function ns.EnsureInit()
     if RegisterAddonEvents then RegisterAddonEvents(); end
     InitializeTalentHooks();
     return true;
-end
-
-function ns.IsGatedInitDeferred()
-    return gatedInitDeferred;
 end
 
 -- ----------------------------------------------------------------------------
@@ -1409,66 +1252,35 @@ local function OnAddonEvent(self, event, arg1, arg2)
     if event == "ADDON_LOADED" then
         if arg1 == ADDON_NAME then
             if IsAddOnLoadedSafe("Blizzard_PlayerSpells") or IsAddOnLoadedSafe("Blizzard_ClassTalentUI") then
-                ns.EnsureGatedInit();
+                ns.EnsureInit();
             end
         elseif arg1 == "Blizzard_PlayerSpells" or arg1 == "Blizzard_ClassTalentUI" then
-            ns.EnsureGatedInit();
+            ns.EnsureInit();
         end
-    elseif event == "ADDON_RESTRICTION_STATE_CHANGED" then
-        -- Payload is (restrictionType, newState). IsAddOnRestrictionActive reads
-        -- FALSE during this dispatch by design, so never query here -- maintain
-        -- per-type marks from the payload and confirm outside dispatch.
-        if arg2 == RestrictionStateID("inactive") then
-            if arg1 ~= nil then restrictedTypes[arg1] = nil; end
-            if next(restrictedTypes) == nil then
-                if C_Timer and C_Timer.After then
-                    C_Timer.After(0, ConfirmRestrictionsCleared);
-                end
-            end
-        else
-            -- Activating (fired before enforcement starts), Active, or unknown.
-            if arg1 ~= nil then restrictedTypes[arg1] = true; end
-            ApplyRestrictionsActive();
-        end
-    elseif event == "PLAYER_REGEN_DISABLED" then
-        -- Entering combat: cancel drags immediately; mark locked only if the
-        -- query agrees. The lock transition is silent by design.
-        ns.CancelDrag();
-        if ns.AreRestrictionsActive() then
-            ApplyRestrictionsActive();
-        end
-    elseif event == "PLAYER_REGEN_ENABLED" then
-        -- Backstop wake-up: covers a restriction-changed registration missed
-        -- during a /reload-in-combat.
-        RefreshRestrictionState();
     elseif event == "PLAYER_LOGIN" or event == "PLAYER_ENTERING_WORLD" then
         if IsAddOnLoadedSafe("Blizzard_PlayerSpells") or IsAddOnLoadedSafe("Blizzard_ClassTalentUI") then
-            ns.EnsureGatedInit();
+            ns.EnsureInit();
         end
         if event == "PLAYER_LOGIN" then
-            -- Midnight: restricted-data predicates (CanPlayerUseTalentUI, talent config
+            -- Midnight: talent-UI predicates (CanPlayerUseTalentUI, talent config
             -- reads, ...) stay pending right after a reload until the player's first real
             -- input finalizes them -- pressing the talent keybind before that silently
             -- no-ops. Reconcile at the moment of first movement (when the pane becomes
             -- usable), with late bounded fallbacks for players who never move.
-            -- Every Reconcile queues harmlessly while locked.
             if C_Timer and C_Timer.After then
                 for _, delay in ipairs({ 5, 15, 30 }) do
                     C_Timer.After(delay, ns.Reconcile);
                 end
             end
         else
-            -- Loading-screen zone change (dungeon/arena/instance entry): check
-            -- protected status first (M+/rated maps restrict on entry), then
-            -- reconcile the new zone's data (queues while locked).
-            RefreshRestrictionState();
+            -- Loading-screen zone change (dungeon/arena/instance entry): Blizzard
+            -- repopulates the dropdown for the new zone, so re-sort right away.
             ScheduleReconcile();
         end
     elseif event == "ZONE_CHANGED" or event == "ZONE_CHANGED_NEW_AREA" then
         -- Zone change without a loading screen (zone-line crossings, M+/arena
-        -- boundary transitions): same protected-status check -- rated PvP and
-        -- Mythic+ hold restrictions while out of combat -- then reconcile.
-        RefreshRestrictionState();
+        -- boundary transitions): same re-sort, data-driven, no flag checks --
+        -- clean chrome serves under any restriction state.
         ScheduleReconcile();
     elseif event == "PLAYER_STARTED_MOVING" then
         if self and self.UnregisterEvent then
@@ -1477,23 +1289,17 @@ local function OnAddonEvent(self, event, arg1, arg2)
         ns.Reconcile();
     elseif event == "TRAIT_CONFIG_LIST_UPDATED" or event == "TRAIT_CONFIG_CREATED"
         or event == "TRAIT_CONFIG_DELETED" or event == "ACTIVE_PLAYER_SPECIALIZATION_CHANGED" then
-        -- Resume backstop: protection lifting without a caught restriction event
-        -- still reinstalls + flushes on the next talent event.
-        ns.EnsureGatedInit();
+        -- Self-heal for a late-loading talent UI: reinstall idempotently, then
+        -- re-sort on the next frame (merge-only, drag-deferred).
+        ns.EnsureInit();
         ScheduleReconcile();
     end
 end
 
 local function OnAddonUpdate(self, elapsed)
     -- OnUpdate only services click-and-hold drag state; list reconciliation is event-driven.
-    -- Idle frames return before the lock check (the query costs a few C calls --
-    -- nothing per-frame). While locked an in-flight gesture is cancelled: the
-    -- activation path already did, so reaching here means a missed event.
+    -- Idle frames return immediately: zero per-frame cost outside a drag gesture.
     if not potentialDrag and not isDragging then return end
-    if ns.IsInteractionLocked() then
-        ns.CancelDrag();
-        return;
-    end
 
     if potentialDrag and not isDragging then
         if IsMouseButtonDown and IsMouseButtonDown("LeftButton") then
@@ -1519,20 +1325,17 @@ local function OnAddonUpdate(self, elapsed)
     end
 end
 
--- All event/script installs funnel through here so a deferred boot can retry
--- them idempotently once protection lifts. Re-registering an event is a no-op
--- and scripts are simply replaced.
+-- All event/script installs funnel through here so any late boot (talent UI
+-- loading after us, /reload timing) retries them idempotently. Re-registering
+-- an event is a no-op and scripts are simply replaced.
 RegisterAddonEvents = function()
     if not eventFrame then return end
     eventFrame:RegisterEvent("ADDON_LOADED");
     eventFrame:RegisterEvent("PLAYER_LOGIN");
     eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD");
-    eventFrame:RegisterEvent("PLAYER_REGEN_DISABLED");
-    eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED");
-    eventFrame:RegisterEvent("ADDON_RESTRICTION_STATE_CHANGED");
     eventFrame:RegisterEvent("PLAYER_STARTED_MOVING");
-    -- Zone changes: with a loading screen (ENTERING_WORLD above) and without
-    -- one -- both re-check protected status (M+/rated zones restrict on entry).
+    -- Zone changes with a loading screen (ENTERING_WORLD above) and without:
+    -- Blizzard repopulates the dropdown across them, so re-sort after each.
     eventFrame:RegisterEvent("ZONE_CHANGED");
     eventFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA");
     -- The same events Blizzard's ClassTalentFrame uses to drive the loadout dropdown.
@@ -1551,11 +1354,10 @@ if Menu and Menu.ModifyMenu then
     Menu.ModifyMenu("MENU_CLASS_TALENT_PROFILE", OnModifyTalentMenu);
 end
 
--- Boot-time restriction evaluation: a /reload landing mid-protection silently
--- defers all gated setup instead of half-installing hooks that would fail
--- silently. Recovery order on lift: restriction-changed confirm, regen-enabled,
--- login backstops, next talent event, next dropdown open.
+-- Boot-time setup: attempt everything at load (clean chrome serves under any
+-- restriction state). Late-loading talent UI is picked up by ADDON_LOADED,
+-- login, talent events, and the next dropdown open -- all idempotent.
 SafeInvoke("bootstrap", function()
-    ns.EnsureGatedInit();
+    ns.EnsureInit();
 end);
 

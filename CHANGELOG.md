@@ -1,7 +1,7 @@
 # Reorder Talent Loadouts — Changelog
 
-## Unreleased
-- Removed the "unavailable while protected" chat notice: blocked input in combat, Mythic+, or PvP is now fully silent (notices never rendered there anyway).
+## v1.8.0
+- Dragging and reset now work everywhere, including combat, Mythic+, and PvP — no more pausing while protected, no chat notices.
 
 ## v1.7.0
 - Fixed drag-and-drop reordering and saved loadout order not being applied — dragging works again and your saved order is used on every open.

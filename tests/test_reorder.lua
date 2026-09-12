@@ -428,16 +428,16 @@ do
     assert_table_eq(sorted, { starterID, 10, 20 }, "SortConfigIDs with Starter Build moved to top")
 end
 
--- Test 7: Combat Lockdown Safety
+-- Test 7: Untracked buttons never start drags (registry gate, not combat)
 do
-    inCombat = true
     local mockBtn = CreateFrame("Button", "MockBtn1")
     mockBtn.rtLoadoutConfigID = 101
 
-    -- Attempt to start drag during combat
+    -- A button the menu callback never registered is not draggable, flagged or not
+    inCombat = true
     addonNamespace.StartDrag(mockBtn)
     -- Verify drag did not start
-    assert_true(mockBtn:GetAlpha() == 1.0, "Combat prevents StartDrag")
+    assert_true(mockBtn:GetAlpha() == 1.0, "Untracked button never starts a drag")
 
     inCombat = false
 end
@@ -542,7 +542,7 @@ do
     assert_true(ReorderTalentLoadoutsDB[pKey][specID] == nil, "DB cleared for spec after reset")
 end
 
--- Test 11: Mid-Drag Combat Abort (PLAYER_REGEN_DISABLED)
+-- Test 11: Combat-flag flips touch neither drags nor reconciliation (no regen handling)
 do
     local specID = 250
     local mockTalentsFrame = PlayerSpellsFrame.TalentsFrame
@@ -550,19 +550,16 @@ do
     local b1 = mockFrames[#mockFrames - 2]
 
     addonNamespace.StartDrag(b1)
-    assert_true(b1:GetAlpha() == 0.35, "Drag started before combat")
+    assert_true(b1:GetAlpha() == 0.35, "Drag started")
 
-    -- Fire combat event
-    local eventFrame = mockFrames[#mockFrames - 3]
-    for _, f in ipairs(mockFrames) do
-        if f.name == "ReorderTalentLoadoutsEventFrame" then
-            f.scripts["OnEvent"](f, "PLAYER_REGEN_DISABLED")
-            break
-        end
-    end
-
-    assert_true(b1:GetAlpha() == 1.0, "Combat abort restored button alpha")
-    assert_table_eq(mockTalentsFrame.LoadSystem.possibleSelections, { 101, 102, 103 }, "Combat abort left order untouched")
+    -- Flag flips change nothing: no regen events installed, no cancels, no queues
+    inCombat = true
+    addonNamespace.UpdateDrag()
+    assert_true(b1:GetAlpha() == 0.35, "Drag persists across combat-flag flips")
+    addonNamespace.CancelDrag()
+    assert_true(b1:GetAlpha() == 1.0, "Drag cancels cleanly while flagged")
+    assert_table_eq(mockTalentsFrame.LoadSystem.possibleSelections, { 101, 102, 103 }, "Cancel while flagged writes nothing")
+    inCombat = false
 end
 
 -- Test 12: Successive Drag Operations
@@ -1339,7 +1336,7 @@ do
     assert_true(source:find('hooksecurefunc(talentsFrame.LoadSystem, "SetSelectionOptions"', 1, true) == nil,
         "LoadSystem:SetSelectionOptions is never hooksecurefunc'd either (no Blizzard Lua method is hooked at all in 12.1)")
     assert_true(source:find("hooksecurefunc", 1, true) == nil,
-        "The addon contains ZERO hooksecurefunc calls (even SecretArguments-protected C functions degrade when hooked)")
+        "The addon contains ZERO hooksecurefunc calls (taint from Lua hooks degraded restricted C APIs with zero flags active)")
 end
 
 -- Test 39: /rtl reset uses taint-safe SetSelectionOptions replica instead of the frame method
@@ -1521,42 +1518,30 @@ do
     -- and 31 (poller sort): all forward parameters through SafeInvoke.
 end
 
--- Test 44: restriction query -- all six types, combat-flag fallback when API is absent
+-- Test 44: static -- no restriction-state machinery remains (blind-attempt model)
 do
-    assert_true(C_RestrictedActions == nil, "unit env has no C_RestrictedActions (fallback path by default)")
-    inCombat = false
-    assert_true(addonNamespace.AreRestrictionsActive() == false, "fallback query is clear out of combat")
-    inCombat = true
-    assert_true(addonNamespace.AreRestrictionsActive() == true, "fallback query follows InCombatLockdown")
-    inCombat = false
+    local f = io.open("Reorder_Talent_Loadouts.lua", "r")
+    local source = f:read("*a")
+    f:close()
 
-    -- Mock the 12.x API: locked if ANY of the six types is active
-    local activeTypes = {}
-    C_RestrictedActions = {
-        IsAddOnRestrictionActive = function(t) return activeTypes[t] and true or false end,
-    }
-    Enum = {
-        AddOnRestrictionType = { Combat = 10, Encounter = 11, ChallengeMode = 12, PvPMatch = 13, Map = 14, Chat = 15 },
-        AddOnRestrictionState = { Inactive = 0, Activating = 1, Active = 2 },
-    }
-    local queried = {}
-    local origQuery = C_RestrictedActions.IsAddOnRestrictionActive
-    C_RestrictedActions.IsAddOnRestrictionActive = function(t)
-        queried[t] = true
-        return origQuery(t)
-    end
-    assert_true(addonNamespace.AreRestrictionsActive() == false, "all-types query clear when none active")
-    for _, id in ipairs({ 10, 11, 12, 13, 14, 15 }) do
-        assert_true(queried[id], "restriction query covers type id " .. id)
-    end
-    activeTypes[13] = true -- PvPMatch alone, out of combat
-    assert_true(addonNamespace.AreRestrictionsActive() == true, "PvPMatch restriction locks while out of combat")
-    activeTypes[13] = nil
-    C_RestrictedActions = nil
-    Enum = nil
+    assert_true(source:find("IsInteractionLocked", 1, true) == nil,
+        "No IsInteractionLocked anywhere (flag locks over-block clean chrome)")
+    assert_true(source:find("AreRestrictionsActive", 1, true) == nil,
+        "No AreRestrictionsActive query (flags are the risk signal, not the gate)")
+    assert_true(source:find("EnsureGatedInit", 1, true) == nil,
+        "No EnsureGatedInit (setup installs unconditionally via EnsureInit)")
+    assert_true(source:find("ADDON_RESTRICTION_STATE_CHANGED", 1, true) == nil,
+        "No restriction-state event (nothing left to wake)")
+    assert_true(source:find("PLAYER_REGEN_DISABLED", 1, true) == nil
+        and source:find("PLAYER_REGEN_ENABLED", 1, true) == nil,
+        "No regen events (combat transitions need nothing)")
+    assert_true(source:find("C_RestrictedActions", 1, true) == nil,
+        "No restriction query API consumed at all")
+    assert_true(source:find("function ns.EnsureInit()", 1, true) ~= nil,
+        "EnsureInit installs unconditionally")
 end
 
--- Test 45: /reload-in-combat defers gated setup; lift resumes it
+-- Test 45: boot installs immediately while flagged (no deferral, no lift needed)
 do
     local showHooks = {}
     local mockPane = {
@@ -1580,21 +1565,16 @@ do
     end
     assert_true(evFrame ~= nil, "event frame exists")
 
-    inCombat = true -- /reload landed mid-combat (fallback query)
+    inCombat = true -- /reload landed mid-combat: installs still attempt at once
     evFrame.scripts["OnEvent"](evFrame, "ADDON_LOADED", "Blizzard_PlayerSpells")
-    assert_true(#showHooks == 0, "OnShow hook NOT installed while protected")
-    assert_true(addonNamespace.IsGatedInitDeferred() == true, "gated init remembered as deferred")
+    assert_true(#showHooks == 1, "OnShow hook installed immediately while flagged")
+    assert_true(showHooks[1].script == "OnShow", "installed hook is the talent-pane OnShow reconcile")
 
     inCombat = false
-    evFrame.scripts["OnEvent"](evFrame, "PLAYER_REGEN_ENABLED")
-    assert_true(#showHooks == 1, "OnShow hook installed on lift")
-    assert_true(showHooks[1].script == "OnShow", "deferred hook is the talent-pane OnShow reconcile")
-    assert_true(addonNamespace.IsGatedInitDeferred() == false, "deferred flag cleared on lift")
-
     PlayerSpellsFrame = savedPSF
 end
 
--- Test 46: drag refused while protected (silently), allowed when clear
+-- Test 46: drags arm and start while flagged (clean chrome serves under any state)
 do
     local evFrame = nil
     for _, f in ipairs(mockFrames) do
@@ -1602,38 +1582,34 @@ do
     end
 
     addonNamespace.ClearActiveButtons()
-    local b = CreateFrame("Button", "LockDragBtn")
+    local b = CreateFrame("Button", "FlagDragBtn")
     b:SetRect(50, 200, 200, 20)
     b:Show()
     addonNamespace.SetupLoadoutButton(b, { GetData = function() return 111 end, SetCanSelect = function() end }, nil, 111)
+    assert_true(b.registeredDrag ~= nil, "RegisterForDrag installed while flagged")
 
     local chatBase = #DEFAULT_CHAT_FRAME.messages
     inCombat = true
     addonNamespace.StartDrag(b)
-    assert_true(b:GetAlpha() == 1.0, "drag refused while protected")
-    assert_true(#DEFAULT_CHAT_FRAME.messages == chatBase, "blocked drag is silent (no chat in combat)")
-    addonNamespace.StartDrag(b)
-    assert_true(#DEFAULT_CHAT_FRAME.messages == chatBase, "repeat blocked drag stays silent")
+    assert_true(b:GetAlpha() == 0.35, "drag starts while flagged")
+    assert_true(#DEFAULT_CHAT_FRAME.messages == chatBase, "flagged drag reports nothing (no lock notices at all)")
+    addonNamespace.CancelDrag()
+    assert_true(b:GetAlpha() == 1.0, "flagged drag cleaned up")
 
-    -- A press while protected must not even arm potentialDrag (OnUpdate early-outs)
+    -- A press while flagged arms potentialDrag and OnUpdate drives it into a drag
     cursorX, cursorY = 100, 100
+    leftMouseDown = true
     b.scripts["OnMouseDown"](b, "LeftButton")
     cursorX, cursorY = 150, 150
-    leftMouseDown = true
     evFrame.scripts["OnUpdate"](evFrame, 0.016)
-    assert_true(b:GetAlpha() == 1.0, "press-while-locked never arms a drag")
+    assert_true(b:GetAlpha() == 0.35, "press-while-flagged arms a drag via OnUpdate")
     leftMouseDown = false
     addonNamespace.CancelDrag()
 
     inCombat = false
-    evFrame.scripts["OnEvent"](evFrame, "PLAYER_REGEN_ENABLED") -- lift resumes
-    addonNamespace.StartDrag(b)
-    assert_true(b:GetAlpha() == 0.35, "drag allowed once clear")
-    addonNamespace.CancelDrag()
-    assert_true(b:GetAlpha() == 1.0, "lock test drag cleaned up")
 end
 
--- Test 47: activation cancels an active drag; queued reconcile flushes on lift
+-- Test 47: full drag lifecycle persists while flagged; stray combat events are no-ops
 do
     local evFrame = nil
     for _, f in ipairs(mockFrames) do
@@ -1660,80 +1636,55 @@ do
     PlayerSpellsFrame = { TalentsFrame = pane }
 
     addonNamespace.ClearActiveButtons()
-    local b1 = CreateFrame("Button", "QLockB1")
+    local b1 = CreateFrame("Button", "QFlagB1")
     b1:SetRect(50, 200, 200, 20)
-    local b2 = CreateFrame("Button", "QLockB2")
+    local b2 = CreateFrame("Button", "QFlagB2")
     b2:SetRect(50, 180, 200, 20)
     addonNamespace.SetupLoadoutButton(b1, { GetData = function() return 901 end, SetCanSelect = function() end }, nil, 901)
     addonNamespace.SetupLoadoutButton(b2, { GetData = function() return 902 end, SetCanSelect = function() end }, nil, 902)
 
-    inCombat = false
+    -- Saved order applies while flagged (flags are not the gate)
+    inCombat = true
     addonNamespace.Reconcile()
-    assert_table_eq(pane.LoadSystem.possibleSelections, { 902, 901 }, "sanity: saved order applied when clear")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 902, 901 }, "saved order applies while flagged")
 
-    -- Scramble, lock, reconcile queues instead of writing
+    -- Full drag lifecycle while flagged: 901 drops below 902 and persists
     pane.LoadSystem.possibleSelections = { 901, 902 }
-    inCombat = true
-    addonNamespace.Reconcile()
-    assert_table_eq(pane.LoadSystem.possibleSelections, { 901, 902 }, "no dropdown writes while protected")
-
-    -- Active drag at activation moment is cancelled without writes
-    inCombat = false
     addonNamespace.StartDrag(b1)
-    assert_true(b1:GetAlpha() == 0.35, "drag started before activation")
-    inCombat = true
-    evFrame.scripts["OnEvent"](evFrame, "PLAYER_REGEN_DISABLED")
-    assert_true(b1:GetAlpha() == 1.0, "activation cancels the active drag")
-    assert_table_eq(pane.LoadSystem.possibleSelections, { 901, 902 }, "cancelled drag writes nothing")
-
-    -- Race: release landing the same frame as activation writes nothing either
-    inCombat = false
-    addonNamespace.StartDrag(b2)
-    cursorX, cursorY = 100, 215 -- above b1: would move 902 to top
+    assert_true(b1:GetAlpha() == 0.35, "drag started while flagged")
+    cursorX, cursorY = 100, 170 -- below b2: drop at the end
     addonNamespace.UpdateDrag()
-    inCombat = true
     addonNamespace.FinishDrag()
-    assert_table_eq(pane.LoadSystem.possibleSelections, { 901, 902 }, "release-during-lock writes nothing")
-    assert_true(b2:GetAlpha() == 1.0, "race visuals cleaned up")
+    assert_true(b1:GetAlpha() == 1.0, "flagged drag visuals cleaned up")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 902, 901 }, "flagged drag persists the new order")
 
-    -- Lift flushes the queued reconcile
-    inCombat = false
-    evFrame.scripts["OnEvent"](evFrame, "PLAYER_REGEN_ENABLED")
-    assert_table_eq(pane.LoadSystem.possibleSelections, { 902, 901 }, "queued reconcile flushes on lift")
+    -- Stray combat-transition events change nothing (no handler branches)
+    local okFire = pcall(evFrame.scripts["OnEvent"], evFrame, "PLAYER_REGEN_DISABLED")
+    assert_true(okFire, "stray regen-disabled is a safe no-op")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 902, 901 }, "stray event writes nothing")
 
     PlayerSpellsFrame = savedPSF
     inCombat = false
 end
 
--- Test 48: ADDON_RESTRICTION_STATE_CHANGED payload protocol (never query during dispatch)
+-- Test 48: no lock-machinery events registered; stray ones are safe no-ops
 do
-    -- The query lies false during dispatch by design -- the handler must run on payload alone
-    C_RestrictedActions = {
-        IsAddOnRestrictionActive = function(t) return false end,
-    }
-    Enum = {
-        AddOnRestrictionType = { Combat = 0, Encounter = 1, ChallengeMode = 2, PvPMatch = 3, Map = 4, Chat = 5 },
-        AddOnRestrictionState = { Inactive = 0, Activating = 1, Active = 2 },
-    }
     local evFrame = nil
     for _, f in ipairs(mockFrames) do
         if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
     end
 
-    evFrame.scripts["OnEvent"](evFrame, "ADDON_RESTRICTION_STATE_CHANGED", 2, 1) -- ChallengeMode Activating
-    assert_true(addonNamespace.IsInteractionLocked() == true, "Activating payload locks (query would lie false here)")
-    evFrame.scripts["OnEvent"](evFrame, "ADDON_RESTRICTION_STATE_CHANGED", 3, 2) -- PvPMatch Active
-    evFrame.scripts["OnEvent"](evFrame, "ADDON_RESTRICTION_STATE_CHANGED", 2, 0) -- ChallengeMode done
-    assert_true(addonNamespace.IsInteractionLocked() == true, "remaining mark keeps the lock")
-    -- Final Inactive confirm runs via the immediate C_Timer mock, queries clear, lifts
-    evFrame.scripts["OnEvent"](evFrame, "ADDON_RESTRICTION_STATE_CHANGED", 3, 0)
-    assert_true(addonNamespace.IsInteractionLocked() == false, "lock lifts after final Inactive + out-of-dispatch confirm")
-
-    C_RestrictedActions = nil
-    Enum = nil
+    assert_true(evFrame.events["ADDON_RESTRICTION_STATE_CHANGED"] == nil, "restriction-state event not registered")
+    assert_true(evFrame.events["PLAYER_REGEN_DISABLED"] == nil, "regen-disabled not registered")
+    assert_true(evFrame.events["PLAYER_REGEN_ENABLED"] == nil, "regen-enabled not registered")
+    assert_true(evFrame.events["ADDON_LOADED"] and evFrame.events["PLAYER_LOGIN"]
+        and evFrame.events["PLAYER_ENTERING_WORLD"] and evFrame.events["TRAIT_CONFIG_LIST_UPDATED"],
+        "core + talent events registered")
+    local okFire = pcall(evFrame.scripts["OnEvent"], evFrame, "ADDON_RESTRICTION_STATE_CHANGED", 2, 2)
+    assert_true(okFire, "stray restriction event is a safe no-op")
 end
 
--- Test 49: reset button hides while protected and refuses presses
+-- Test 49: reset button shows and resets while flagged
 do
     local specID = 250
     local pKey = addonNamespace.GetPlayerKey()
@@ -1760,7 +1711,7 @@ do
     PlayerSpellsFrame = { TalentsFrame = pane }
 
     addonNamespace._ResetHookStateForTest()
-    inCombat = false
+    inCombat = true -- flagged throughout: button still builds, shows, and fires
     addonNamespace.InitializeTalentHooks() -- creates the reset button
     addonNamespace.UpdateResetButton()
 
@@ -1768,27 +1719,18 @@ do
     for _, f in ipairs(mockFrames) do
         if f.name == "ReorderTalentLoadoutsResetButton" then resetBtn = f; break end
     end
-    assert_true(resetBtn ~= nil, "reset button created")
-    assert_true(resetBtn:IsShown() == true, "reset button visible when open + order present")
+    assert_true(resetBtn ~= nil, "reset button created while flagged")
+    assert_true(resetBtn:IsShown() == true, "reset button visible while flagged when open + order present")
 
-    inCombat = true
-    addonNamespace.UpdateResetButton()
-    assert_true(resetBtn:IsShown() == false, "reset button hides while protected")
     resetBtn.scripts["OnMouseDown"](resetBtn, "LeftButton")
-    assert_true(ReorderTalentLoadoutsDB[pKey][specID] ~= nil, "reset press refused while protected")
+    assert_true(ReorderTalentLoadoutsDB[pKey][specID] == nil, "reset press clears while flagged")
+    assert_true(resetBtn:IsShown() == false, "reset button hides after clearing (no order left)")
 
     inCombat = false
-    local evFrame = nil
-    for _, f in ipairs(mockFrames) do
-        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
-    end
-    evFrame.scripts["OnEvent"](evFrame, "PLAYER_REGEN_ENABLED")
-    assert_true(resetBtn:IsShown() == true, "reset button returns on lift")
-
     PlayerSpellsFrame = savedPSF
 end
 
--- Test 51: zone changes without a loading screen re-check protected status
+-- Test 51: zone changes re-sort immediately while flagged (data-driven, no locks)
 do
     local evFrame = nil
     for _, f in ipairs(mockFrames) do
@@ -1816,24 +1758,21 @@ do
     local savedPSF = PlayerSpellsFrame
     PlayerSpellsFrame = { TalentsFrame = pane }
 
-    -- Crossing into danger: ZONE_CHANGED while flagged locks everything
+    -- Zone crossings re-sort at once even while flagged (scheduled reconcile
+    -- runs via the immediate C_Timer mock)
     inCombat = true
     evFrame.scripts["OnEvent"](evFrame, "ZONE_CHANGED")
-    assert_true(addonNamespace.IsInteractionLocked() == true, "zone change into combat locks")
-    addonNamespace.Reconcile()
-    assert_table_eq(pane.LoadSystem.possibleSelections, { 601, 602 }, "zone reconcile queues while protected")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 602, 601 }, "zone change re-sorts while flagged")
 
-    -- Crossing back out: ZONE_CHANGED_NEW_AREA lifts and flushes
-    inCombat = false
+    pane.LoadSystem.possibleSelections = { 601, 602 }
     evFrame.scripts["OnEvent"](evFrame, "ZONE_CHANGED_NEW_AREA")
-    assert_true(addonNamespace.IsInteractionLocked() == false, "zone change out lifts the lock")
-    assert_table_eq(pane.LoadSystem.possibleSelections, { 602, 601 }, "zone reconcile flushes on lift")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 602, 601 }, "zone-new-area re-sorts while flagged")
 
     PlayerSpellsFrame = savedPSF
     inCombat = false
 end
 
--- Test 52: Mythic+ zone holds protection out of combat; leaving flushes
+-- Test 52: active restriction types change nothing (flags are not the gate)
 do
     local challengeActive = true
     C_RestrictedActions = {
@@ -1867,16 +1806,28 @@ do
     local savedPSF = PlayerSpellsFrame
     PlayerSpellsFrame = { TalentsFrame = pane }
 
-    inCombat = false -- M+ restricts out of combat the whole time
+    inCombat = false -- M+ restricts out of combat the whole time; the addon ignores it
     evFrame.scripts["OnEvent"](evFrame, "ZONE_CHANGED_NEW_AREA") -- entering the keystone
-    assert_true(addonNamespace.IsInteractionLocked() == true, "M+ zone restricts out of combat")
-    addonNamespace.Reconcile()
-    assert_table_eq(pane.LoadSystem.possibleSelections, { 701, 702 }, "no dropdown writes inside the keystone")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 702, 701 }, "order applies inside the keystone")
 
-    challengeActive = false -- key done, zoned out
-    evFrame.scripts["OnEvent"](evFrame, "ZONE_CHANGED")
-    assert_true(addonNamespace.IsInteractionLocked() == false, "lock lifts after leaving M+")
-    assert_table_eq(pane.LoadSystem.possibleSelections, { 702, 701 }, "queued order applies after leaving M+")
+    -- Drags arm and persist under active types too
+    addonNamespace.ClearActiveButtons()
+    local b1 = CreateFrame("Button", "QKeyB1")
+    b1:SetRect(50, 200, 200, 20)
+    local b2 = CreateFrame("Button", "QKeyB2")
+    b2:SetRect(50, 180, 200, 20)
+    addonNamespace.SetupLoadoutButton(b1, { GetData = function() return 701 end, SetCanSelect = function() end }, nil, 701)
+    addonNamespace.SetupLoadoutButton(b2, { GetData = function() return 702 end, SetCanSelect = function() end }, nil, 702)
+    pane.LoadSystem.possibleSelections = { 701, 702 }
+    addonNamespace.StartDrag(b1)
+    cursorX, cursorY = 100, 170
+    addonNamespace.UpdateDrag()
+    addonNamespace.FinishDrag()
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 702, 701 }, "drag persists under active types")
+
+    challengeActive = false -- key done; nothing to flush, nothing was ever queued
+    addonNamespace.Reconcile()
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 702, 701 }, "order stable after leaving M+")
 
     PlayerSpellsFrame = savedPSF
     C_RestrictedActions = nil
@@ -2029,7 +1980,7 @@ do
     assert_table_eq(addonNamespace.GetSavedOrder(pKey, 250).order, { 30, 10, 20 }, "spec isolation preserved")
 end
 
--- Test 53: static -- visibility uses Show/Hide; no stale combat-flag gates; zone events wired
+-- Test 53: static -- visibility uses Show/Hide; no flag reads; zone events wired
 do
     local f = io.open("Reorder_Talent_Loadouts.lua", "r")
     local source = f:read("*a")
@@ -2037,13 +1988,11 @@ do
 
     assert_true(source:find(":SetShown(", 1, true) == nil,
         "No SetShown calls anywhere (AllowedWhenUntainted + Shown aspect; Show/Hide carry no gate)")
-    assert_true(source:find("InCombatLockdown and InCombatLockdown()", 1, true) == nil,
-        "No direct combat-flag gates remain (all interactions use IsInteractionLocked)")
-    assert_true(source:find("ADDON_RESTRICTION_STATE_CHANGED", 1, true) ~= nil,
-        "Addon listens for restriction changes to defer and resume gated work")
+    assert_true(source:find("InCombatLockdown", 1, true) == nil,
+        "No combat-flag reads remain (flag flips change nothing)")
     assert_true(source:find('RegisterEvent("ZONE_CHANGED")', 1, true) ~= nil
         and source:find('RegisterEvent("ZONE_CHANGED_NEW_AREA")', 1, true) ~= nil,
-        "Zone-change events registered (M+/rated zones restrict on entry, out of combat)")
+        "Zone-change events registered (Blizzard repopulates across them)")
     assert_true(source:find("SendChatMessage", 1, true) == nil,
         "No outbound chat transmission (blocked in instances/M+/PvP since 12.0)")
     assert_true(source:find("COMBAT_LOG_EVENT", 1, true) == nil,

@@ -507,7 +507,7 @@ if desc6 then
 end
 ok(initRan >= 4, "SetupLoadoutButton works against mock menu buttons", initRan);
 
-print("\n== Sim 7: restriction lock queues reconcile; lift flushes (REGEN_ENABLED backstop) ==");
+print("\n== Sim 7: reconcile applies while flagged; no lock machinery to lift ==");
 _G.Enum = {
     AddOnRestrictionType = { Combat = 0, Encounter = 1, ChallengeMode = 2, PvPMatch = 3, Map = 4, Chat = 5 },
     AddOnRestrictionState = { Inactive = 0, Activating = 1, Active = 2 },
@@ -519,21 +519,21 @@ _G.C_RestrictedActions = {
 do
     local eventFrame = _G["ReorderTalentLoadoutsEventFrame"];
     ok(eventFrame ~= nil and eventFrame.scripts["OnEvent"] ~= nil, "event controller registered");
-    -- Scramble back to Blizzard default order, then protect and reconcile.
+    -- Scramble back to Blizzard default order, then flag and reconcile: clean
+    -- chrome serves under any restriction state, so the saved order applies at
+    -- once (flags are not the gate -- the addon never queries them).
     loadSystem.possibleSelections = { 3003, 3001, 3002, 999999 };
     simRestricted = true;
     ns.Reconcile();
-    local frozen = {};
-    for i, id in ipairs(loadSystem.possibleSelections) do frozen[i] = id; end
-    ok(table.concat(frozen, ",") == "3003,3001,3002,999999", "no dropdown writes while protected", table.concat(frozen, ","));
-    -- Lift via the regen-enabled backstop (sim C_Timer.After is a noop, so the
-    -- restriction-changed timer confirm cannot run here -- by design the event
-    -- path must also resume).
-    simRestricted = false;
-    eventFrame.scripts["OnEvent"](eventFrame, "PLAYER_REGEN_ENABLED");
-    local lifted = {};
-    for i, id in ipairs(loadSystem.possibleSelections) do lifted[i] = id; end
-    ok(table.concat(lifted, ",") == "3001,3003,3002,999999", "queued reconcile flushes on lift", table.concat(lifted, ","));
+    local applied = {};
+    for i, id in ipairs(loadSystem.possibleSelections) do applied[i] = id; end
+    ok(table.concat(applied, ",") == "3001,3003,3002,999999", "saved order applies while flagged", table.concat(applied, ","));
+    -- Stray combat-transition events are safe no-ops (no handler branches).
+    local okFire = pcall(eventFrame.scripts["OnEvent"], eventFrame, "PLAYER_REGEN_DISABLED");
+    ok(okFire, "stray regen-disabled is a safe no-op");
+    local kept = {};
+    for i, id in ipairs(loadSystem.possibleSelections) do kept[i] = id; end
+    ok(table.concat(kept, ",") == "3001,3003,3002,999999", "stray event writes nothing", table.concat(kept, ","));
 end
 
 print(("\n=== Sim Results: %d passed, %d failed ==="):format(PASS, FAIL));
