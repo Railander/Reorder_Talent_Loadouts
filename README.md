@@ -1,6 +1,6 @@
 # Reorder Talent Loadouts
 
-A lightweight World of Warcraft addon that adds drag-and-drop reordering to the talent loadout dropdown.
+Super lightweight addon that adds drag-and-drop reordering to the talent loadout dropdown.
 
 ![preview](preview.gif)
 
@@ -10,10 +10,9 @@ Open your talents, open the loadout dropdown, then **click and hold** a loadout 
 
 An undo-arrow button next to the dropdown (visible only while it's open and you've customized the order) resets the current spec back to the default order.
 
-## Details
+Orders persist per character and per specialization across reloads, logouts and client restarts.
 
-- Orders persist per character and per specialization across reloads, logouts and client restarts.
-- Zero configuration — normal clicks, the gear menu and other addons keep working untouched.
+Zero configuration — normal clicks, the gear menu and other addons keep working untouched.
 
 ## Compatibility
 
