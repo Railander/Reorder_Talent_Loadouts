@@ -2,7 +2,7 @@
 
 Super lightweight addon that adds drag-and-drop reordering to the talent loadout dropdown.
 
-![preview](preview.gif)
+![preview](https://media.forgecdn.net/attachments/description/null/description_990171aa-687a-4991-b5eb-e52808a479ca.gif)
 
 ## Usage
 
