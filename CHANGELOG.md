@@ -1,4 +1,4 @@
-# Reorder Talent Loadouts — Changelog
+# Reorder Talent Loadouts Changelog
 
 ## v1.8.0
 - Dragging and reset now work everywhere, including combat, Mythic+, and PvP — no more pausing while protected, no chat notices.
