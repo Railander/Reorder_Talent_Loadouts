@@ -16,7 +16,7 @@ Zero configuration — normal clicks, the gear menu and other addons keep workin
 
 ## Compatibility
 
-World of Warcraft: Midnight (12.1.0)
+- World of Warcraft: Midnight (12.1.0)
 
 ## Links
 
