@@ -16,7 +16,7 @@ Zero configuration — normal clicks, the gear menu and other addons keep workin
 
 ## Compatibility
 
-Works on Modern (retail / Midnight). Dragging works everywhere, including combat, Mythic+, and PvP.
+World of Warcraft: Midnight (12.1.0)
 
 ## Links
 
