@@ -597,7 +597,7 @@ end
 function ns.FinishDrag()
     -- Fail-open: the drop applies the persisted order; never raise into input handlers.
     SafeInvoke("finishDrag", FinishDragInner);
-    if UpdateResetButton then UpdateResetButton(); end
+    if UpdateResetButton then SafeInvoke("resetVisibility", UpdateResetButton); end
 end
 
 function ns.CancelDrag()

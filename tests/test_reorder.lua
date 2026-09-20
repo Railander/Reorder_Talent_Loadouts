@@ -658,11 +658,6 @@ do
     bTest.mouseOverOverride = true
     bTest:Show()
 
-    local evFrame = nil
-    for _, f in ipairs(mockFrames) do
-        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
-    end
-
     -- Mouse down via the button's own post-hook
     cursorX, cursorY = 100, 100
     bTest.scripts["OnMouseDown"](bTest, "LeftButton")
@@ -1201,11 +1196,11 @@ do
     talentsFrame.configIDs = { 901, 902 }
 
     addonNamespace.InitializeTalentHooks()
-    -- No Blizzard Lua method is hooked (12.1 taint rule); the saved order is applied by the
-    -- pure-data poller path (OnRefreshLoadoutOptions), which the OnUpdate poller invokes.
+    -- No Blizzard Lua method is hooked (12.1 taint rule); the saved order is applied by
+    -- the data-level sort (OnRefreshLoadoutOptions), invoked here from addon execution.
     addonNamespace.OnRefreshLoadoutOptions(talentsFrame)
 
-    assert_table_eq(talentsFrame.LoadSystem.possibleSelections, { 902, 901 }, "Poller sort path applied saved order using C_SpecializationInfo fallback")
+    assert_table_eq(talentsFrame.LoadSystem.possibleSelections, { 902, 901 }, "Sort path applied saved order using C_SpecializationInfo fallback")
 
     talentsFrame.GetSpecID = savedGetSpecID
     C_SpecializationInfo = nil
@@ -1238,7 +1233,7 @@ do
     addonNamespace.OnRefreshLoadoutOptions(talentsFrame)
 
     -- 702 matches name "Raid_SingleTarget" which was first in saved.order, so 702 comes first!
-    assert_table_eq(talentsFrame.LoadSystem.possibleSelections, { 702, 701 }, "Poller sort path successfully migrated order via C_Traits name resolution")
+    assert_table_eq(talentsFrame.LoadSystem.possibleSelections, { 702, 701 }, "Sort path successfully migrated order via C_Traits name resolution")
 
     C_Traits = nil
     talentsFrame.configIDToName = {}
@@ -1375,7 +1370,7 @@ do
     PlayerSpellsFrame = savedPSF
 end
 
--- Test 40: poller repopulates the dropdown when Blizzard's population came back degraded
+-- Test 40: reconcile repopulates the dropdown when Blizzard's population came back degraded
 do
     local specID = 270
     local savedCT = C_ClassTalents
@@ -1997,6 +1992,768 @@ do
         "No outbound chat transmission (blocked in instances/M+/PvP since 12.0)")
     assert_true(source:find("COMBAT_LOG_EVENT", 1, true) == nil,
         "No combat-log registration (registering errors since 12.0)")
+end
+
+-- Test 59: static -- every "...Template" referenced exists in the 12.1.0 dump
+-- (mocks ignore XML templates, so this grep is the only guard against a
+-- missing-template load failure in game) + the reset-button atlas exists
+do
+    local f = io.open("Reorder_Talent_Loadouts.lua", "r")
+    local source = f:read("*a")
+    f:close()
+
+    local seen = {}
+    local templates = {}
+    for name in source:gmatch('"([A-Za-z_]+Template)"') do
+        if not seen[name] then
+            seen[name] = true
+            templates[#templates + 1] = name
+        end
+    end
+    assert_true(#templates > 0, "template references found in addon source")
+
+    local dumpBase = "../source/12.1.0/Interface/AddOns/"
+    for _, name in ipairs(templates) do
+        local h = io.popen('grep -rl \'name="' .. name .. '"\' ' .. dumpBase .. 'Blizzard_SharedXML 2>/dev/null')
+        local out = h:read("*a")
+        h:close()
+        assert_true(out ~= nil and out ~= "", "template " .. name .. " defined in the 12.1.0 dump")
+    end
+
+    -- talents-button-undo atlas (reset button art) must exist in Blizzard UI
+    local ha = io.popen('grep -rl "talents-button-undo" ' .. dumpBase .. ' 2>/dev/null')
+    local outa = ha:read("*a")
+    ha:close()
+    assert_true(outa ~= nil and outa ~= "", "talents-button-undo atlas present in the 12.1.0 dump")
+end
+
+-- Test 60: CalculateNewOrder boundary values (out-of-range, nil, clamps)
+do
+    local list = { 1, 2, 3 }
+    local _, m1 = addonNamespace.CalculateNewOrder(CopyTable(list), 0, 2)
+    assert_true(not m1, "fromIndex 0 is a no-op")
+    local _, m2 = addonNamespace.CalculateNewOrder(CopyTable(list), -1, 2)
+    assert_true(not m2, "negative fromIndex is a no-op")
+    local _, m3 = addonNamespace.CalculateNewOrder(CopyTable(list), 4, 1)
+    assert_true(not m3, "fromIndex beyond end is a no-op")
+    local _, m4 = addonNamespace.CalculateNewOrder(CopyTable(list), 1, nil)
+    assert_true(not m4, "nil targetIndex is a no-op")
+    local _, m5 = addonNamespace.CalculateNewOrder(nil, 1, 2)
+    assert_true(not m5, "nil list is a no-op")
+    -- targetIndex 0/negative clamps to the top (documented clamp, not an error)
+    local r6, m6 = addonNamespace.CalculateNewOrder(CopyTable(list), 3, 0)
+    assert_true(m6, "targetIndex 0 clamps instead of failing")
+    assert_table_eq(r6, { 3, 1, 2 }, "targetIndex 0 lands on top")
+    -- targetIndex far beyond the end clamps to the bottom
+    local r7, m7 = addonNamespace.CalculateNewOrder(CopyTable(list), 1, 99)
+    assert_true(m7, "huge targetIndex clamps instead of failing")
+    assert_table_eq(r7, { 2, 3, 1 }, "huge targetIndex lands at bottom")
+    -- two-item list: swap both directions
+    local r8, m8 = addonNamespace.CalculateNewOrder({ 5, 6 }, 1, 3)
+    assert_true(m8, "two-item move to end")
+    assert_table_eq(r8, { 6, 5 }, "two-item order swapped")
+    local _, m9 = addonNamespace.CalculateNewOrder({ 5, 6 }, 2, 1)
+    assert_true(m9, "two-item move to top")
+end
+
+-- Test 61: SortConfigIDs degradations (nil/empty/single/nil-spec/nil-DB)
+do
+    local pKey = addonNamespace.GetPlayerKey()
+    local specID = 610
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 9, 8 }, names = {} }
+
+    local single = { 8 }
+    assert_table_eq(addonNamespace.SortConfigIDs(specID, single, {}), { 8 }, "single-item list passes through")
+    assert_true(addonNamespace.SortConfigIDs(specID, nil, {}) == nil, "nil list returns nil")
+    assert_table_eq(addonNamespace.SortConfigIDs(specID, {}, {}), {}, "empty list passes through")
+    local cur = { 8, 9 }
+    assert_table_eq(addonNamespace.SortConfigIDs(nil, cur, {}), { 8, 9 }, "nil specID leaves order untouched")
+
+    local savedDB = ReorderTalentLoadoutsDB
+    ReorderTalentLoadoutsDB = nil
+    local okNil, resNil = pcall(addonNamespace.SortConfigIDs, specID, { 8, 9 }, {})
+    assert_true(okNil, "nil DB does not raise")
+    assert_table_eq(resNil, { 8, 9 }, "nil DB leaves order untouched")
+    ReorderTalentLoadoutsDB = savedDB
+end
+
+-- Test 62: SortInPlace + ArraysEqual edges (shrink, grow, nils)
+do
+    assert_true(addonNamespace.ArraysEqual(nil, nil), "nil equals nil")
+    assert_true(not addonNamespace.ArraysEqual(nil, { 1 }), "nil does not equal a list")
+    assert_true(not addonNamespace.ArraysEqual({ 1 }, nil), "list does not equal nil")
+    assert_true(not addonNamespace.ArraysEqual({ 1 }, { 1, 2 }), "length mismatch is unequal")
+
+    local shrink = { 1, 2, 3 }
+    addonNamespace.SortInPlace(shrink, { 3 })
+    assert_table_eq(shrink, { 3 }, "SortInPlace shrinks (truncates tail)")
+    local grow = { 1 }
+    addonNamespace.SortInPlace(grow, { 2, 1 })
+    assert_table_eq(grow, { 2, 1 }, "SortInPlace grows in place")
+    local okSort, _ = pcall(addonNamespace.SortInPlace, nil, { 1 })
+    assert_true(okSort, "SortInPlace on nil table does not raise")
+end
+
+-- Test 63: GetPlayerKey DefaultPlayer fallback (no GUID, no name/realm)
+do
+    local savedGUID, savedName, savedRealm = UnitGUID, UnitName, GetRealmName
+    UnitGUID = function() return nil end
+    UnitName = function() return nil end
+    GetRealmName = function() return "" end
+    assert_eq(addonNamespace.GetPlayerKey(), "DefaultPlayer", "no identity at all falls back to DefaultPlayer")
+    UnitName = function() return "" end
+    assert_eq(addonNamespace.GetPlayerKey(), "DefaultPlayer", "empty name falls back to DefaultPlayer")
+    UnitGUID, UnitName, GetRealmName = savedGUID, savedName, savedRealm
+    assert_eq(addonNamespace.GetPlayerKey(), "Player-1234-00A1B2C3", "identity restored after fallback test")
+end
+
+-- Test 64: GetSpecID nil paths (no source anywhere resolves to nil, never raises)
+do
+    local savedPlayerUtil, savedCSI = PlayerUtil, C_SpecializationInfo
+    PlayerUtil, C_SpecializationInfo = nil, nil
+    local okNil, resNil = pcall(addonNamespace.GetSpecID, nil)
+    assert_true(okNil and resNil == nil, "no frame and no APIs resolves to nil without raising")
+    local okNil2, resNil2 = pcall(addonNamespace.GetSpecID, {})
+    assert_true(okNil2 and resNil2 == nil, "bare frame without GetSpecID resolves to nil")
+    PlayerUtil, C_SpecializationInfo = savedPlayerUtil, savedCSI
+end
+
+-- Test 65: PLAYER_STARTED_MOVING reconciles once then unregisters itself
+do
+    local specID = 650
+    local pKey = addonNamespace.GetPlayerKey()
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 402, 401 }, names = {} }
+    local pane = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        configIDToName = { [401] = "A", [402] = "B" },
+        configIDs = { 401, 402 },
+        LoadSystem = {
+            possibleSelections = { 401, 402 },
+            dropdown = { IsMenuOpen = function() return false end },
+            GetDropdown = function(self) return self.dropdown end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = pane }
+    local evFrame = nil
+    for _, f in ipairs(mockFrames) do
+        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
+    end
+    evFrame:RegisterEvent("PLAYER_STARTED_MOVING")
+    evFrame.scripts["OnEvent"](evFrame, "PLAYER_STARTED_MOVING")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 402, 401 }, "first movement applies the saved order")
+    assert_true(evFrame.events["PLAYER_STARTED_MOVING"] == nil, "movement event unregisters after first fire")
+    PlayerSpellsFrame = savedPSF
+    ReorderTalentLoadoutsDB[pKey][specID] = nil
+end
+
+-- Test 66: PLAYER_LOGIN schedules exactly the 5/15/30s backstops
+do
+    local delays = {}
+    local savedAfter = C_Timer.After
+    C_Timer.After = function(seconds, callback)
+        delays[#delays + 1] = seconds
+    end
+    -- Talent UI not yet loaded at login: EnsureInit finds nothing, backstops still arm
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = nil
+    local evFrame = nil
+    for _, f in ipairs(mockFrames) do
+        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
+    end
+    evFrame.scripts["OnEvent"](evFrame, "PLAYER_LOGIN")
+    C_Timer.After = savedAfter
+    PlayerSpellsFrame = savedPSF
+    table.sort(delays)
+    assert_table_eq(delays, { 5, 15, 30 }, "login arms exactly the 5/15/30s reconcile backstops")
+end
+
+-- Test 67: reconcile defers while a drag is active, applies right after the drop
+do
+    local specID = 670
+    local pKey = addonNamespace.GetPlayerKey()
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 502, 501 }, names = {} }
+    local pane = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        configIDToName = { [501] = "A", [502] = "B" },
+        configIDs = { 501, 502 },
+        LoadSystem = {
+            possibleSelections = { 501, 502 },
+            dropdown = { IsMenuOpen = function() return false end },
+            GetDropdown = function(self) return self.dropdown end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = pane }
+
+    -- Capture (don't run) the deferred timer: under the immediate mock this
+    -- would re-enter ReconcileInner while isDragging is still set.
+    local deferred = {}
+    local savedAfter = C_Timer.After
+    C_Timer.After = function(seconds, callback)
+        deferred[#deferred + 1] = { seconds = seconds, callback = callback }
+    end
+
+    addonNamespace.ClearActiveButtons()
+    local b1 = CreateFrame("Button", "DeferB1")
+    b1:SetRect(50, 200, 200, 20)
+    local b2 = CreateFrame("Button", "DeferB2")
+    b2:SetRect(50, 180, 200, 20)
+    addonNamespace.SetupLoadoutButton(b1, { GetData = function() return 501 end, SetCanSelect = function() end }, nil, 501)
+    addonNamespace.SetupLoadoutButton(b2, { GetData = function() return 502 end, SetCanSelect = function() end }, nil, 502)
+
+    addonNamespace.StartDrag(b1)
+    addonNamespace.Reconcile() -- mid-drag: must defer, never rebuild under the gesture
+    assert_true(#deferred == 1 and deferred[1].seconds == 0.25, "mid-drag reconcile schedules exactly one 0.25s retry")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 501, 502 }, "mid-drag reconcile touches nothing")
+
+    C_Timer.After = savedAfter
+    addonNamespace.CancelDrag() -- drop the gesture without persisting
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 501, 502 }, "cancelled drag writes nothing")
+    deferred[1].callback() -- the deferred retry fires after the gesture
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 502, 501 }, "deferred retry applies the saved order after the drag")
+
+    PlayerSpellsFrame = savedPSF
+    ReorderTalentLoadoutsDB[pKey][specID] = nil
+end
+
+-- Test 68: TRAIT_CONFIG_* events reinstall idempotently and re-sort on next frame
+do
+    local specID = 680
+    local pKey = addonNamespace.GetPlayerKey()
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 602, 601 }, names = {} }
+    local pane = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        configIDToName = { [601] = "A", [602] = "B" },
+        configIDs = { 601, 602 },
+        HookScript = function() end,
+        LoadSystem = {
+            possibleSelections = { 601, 602 },
+            dropdown = { IsMenuOpen = function() return false end },
+            GetDropdown = function(self) return self.dropdown end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = pane }
+    local evFrame = nil
+    for _, f in ipairs(mockFrames) do
+        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
+    end
+    for _, ev in ipairs({ "TRAIT_CONFIG_CREATED", "TRAIT_CONFIG_LIST_UPDATED", "TRAIT_CONFIG_DELETED" }) do
+        pane.LoadSystem.possibleSelections = { 601, 602 } -- scramble back to default
+        evFrame.scripts["OnEvent"](evFrame, ev)
+        assert_table_eq(pane.LoadSystem.possibleSelections, { 602, 601 }, ev .. " re-sorts the dropdown")
+    end
+    -- Spec change across specs: the other spec's order applies, nothing leaks
+    ReorderTalentLoadoutsDB[pKey][681] = { order = { 702, 701 }, names = {} }
+    pane.GetSpecID = function() return 681 end
+    pane.configIDToName = { [701] = "X", [702] = "Y" }
+    pane.LoadSystem.possibleSelections = { 701, 702 }
+    evFrame.scripts["OnEvent"](evFrame, "ACTIVE_PLAYER_SPECIALIZATION_CHANGED")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 702, 701 }, "spec change applies the new spec's own order")
+    PlayerSpellsFrame = savedPSF
+    ReorderTalentLoadoutsDB[pKey][specID] = nil
+    ReorderTalentLoadoutsDB[pKey][681] = nil
+end
+
+-- Test 69: PLAYER_ENTERING_WORLD re-sorts after a loading screen
+do
+    local specID = 690
+    local pKey = addonNamespace.GetPlayerKey()
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 802, 801 }, names = {} }
+    local pane = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        configIDToName = { [801] = "A", [802] = "B" },
+        configIDs = { 801, 802 },
+        HookScript = function() end,
+        LoadSystem = {
+            possibleSelections = { 801, 802 },
+            dropdown = { IsMenuOpen = function() return false end },
+            GetDropdown = function(self) return self.dropdown end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = pane }
+    local evFrame = nil
+    for _, f in ipairs(mockFrames) do
+        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
+    end
+    evFrame.scripts["OnEvent"](evFrame, "PLAYER_ENTERING_WORLD")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 802, 801 }, "entering-world re-sorts after the load screen")
+    PlayerSpellsFrame = savedPSF
+    ReorderTalentLoadoutsDB[pKey][specID] = nil
+end
+
+-- Test 70: merge-only survival -- foreign injected entries are never removed
+do
+    local specID = 700
+    local pKey = addonNamespace.GetPlayerKey()
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 902, 901 }, names = {} }
+
+    -- Another addon injected 999 into the live list; neither the saved order
+    -- nor the ground truth knows it, yet it must survive every path.
+    local savedCT = C_ClassTalents
+    local savedTraits = C_Traits
+    C_ClassTalents = {
+        GetConfigIDsBySpecID = function() return { 901, 902 } end,
+    }
+    C_Traits = {
+        GetConfigInfo = function(id) return { name = "N" .. id } end,
+    }
+    local setSelectionArgs = nil
+    local pane = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        configIDToName = { [901] = "A", [902] = "B" },
+        LoadSystem = {
+            possibleSelections = { 901, 999, 902 },
+            SetSelectionOptions = function(self, options)
+                setSelectionArgs = CopyTable(options)
+                self.possibleSelections = CopyTable(options)
+            end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = pane }
+
+    -- Sort path keeps the foreign entry (appended behind the saved order)
+    local sorted = addonNamespace.SortConfigIDs(specID, { 901, 999, 902 }, { [901] = "A", [902] = "B" })
+    assert_table_eq(sorted, { 902, 901, 999 }, "sort appends foreign entries instead of removing them")
+
+    -- Reconcile path: foreign entry is not ground truth, but repopulation is
+    -- merge-only so a healthy list is left untouched entirely
+    pane.LoadSystem.possibleSelections = { 902, 901, 999 }
+    addonNamespace.Reconcile()
+    assert_true(setSelectionArgs == nil, "reconcile does not rebuild a complete list")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 902, 901, 999 }, "foreign entry survives reconcile")
+
+    PlayerSpellsFrame = savedPSF
+    C_ClassTalents, C_Traits = savedCT, savedTraits
+    ReorderTalentLoadoutsDB[pKey][specID] = nil
+end
+
+-- Test 71: reset with no saved order still restores the default list cleanly
+do
+    local specID = 710
+    local pKey = addonNamespace.GetPlayerKey()
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = nil
+    local setSelectionArgs = nil
+    local pane = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        configIDToName = { [1] = "A", [2] = "B" },
+        configIDs = { 1, 2 },
+        LoadSystem = {
+            possibleSelections = { 2, 1 },
+            SetSelectionOptions = function(self, options)
+                setSelectionArgs = CopyTable(options)
+                self.possibleSelections = CopyTable(options)
+            end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = pane }
+    local chatBase = #DEFAULT_CHAT_FRAME.messages
+    assert_true(addonNamespace.ResetCurrentSpecOrder(false), "reset reports success with nothing saved")
+    assert_true(setSelectionArgs ~= nil, "reset still restores the default list via the replica")
+    assert_table_eq(setSelectionArgs, { 1, 2 }, "replica receives the frame's default configIDs")
+    assert_true(#DEFAULT_CHAT_FRAME.messages == chatBase, "silent reset prints nothing")
+    PlayerSpellsFrame = savedPSF
+end
+
+-- Test 72: click selection is suppressed during and just after a drag
+do
+    local capturedCanSelect = nil
+    local mockDesc = {
+        GetData = function() return 7272 end,
+        SetCanSelect = function(self, fn) capturedCanSelect = fn end,
+        SetSoundKit = function() end,
+        AddInitializer = function() end,
+    }
+    local mockRoot = {
+        EnumerateElementDescriptions = function()
+            local elements = { mockDesc }
+            local i = 0
+            return function()
+                i = i + 1
+                if elements[i] then return i, elements[i] end
+                return nil
+            end
+        end,
+        AddMenuReleasedCallback = function() end,
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = {
+        TalentsFrame = {
+            GetSpecID = function() return 250 end,
+            IsInspecting = function() return false end,
+            LoadSystem = {
+                possibleSelections = { 7272 },
+                GetDropdown = function(self) return nil end,
+            },
+        },
+    }
+    Menu.callbacks["MENU_CLASS_TALENT_PROFILE"](nil, mockRoot, nil)
+    assert_true(capturedCanSelect ~= nil, "SetCanSelect wrapper installed")
+    assert_true(capturedCanSelect() == true, "clicks select normally at rest")
+
+    local b = CreateFrame("Button", "CanSelectBtn")
+    b:SetRect(50, 200, 200, 20)
+    addonNamespace.ClearActiveButtons()
+    addonNamespace.SetupLoadoutButton(b, { GetData = function() return 7272 end, SetCanSelect = function() end }, nil, 7272)
+    addonNamespace.StartDrag(b)
+    assert_true(capturedCanSelect() == false, "clicks suppressed while dragging")
+    -- The post-release guard window is a 0.2s timer: hold it with a capturing
+    -- stub (the immediate mock would collapse it) and prove both halves.
+    local captured = {}
+    local savedAfter = C_Timer.After
+    C_Timer.After = function(seconds, callback)
+        captured[#captured + 1] = { seconds = seconds, callback = callback }
+    end
+    cursorX, cursorY = 100, 100
+    addonNamespace.FinishDrag() -- no target under the cursor: drop cancelled
+    C_Timer.After = savedAfter
+    assert_true(capturedCanSelect() == false, "clicks suppressed just after release (guard window)")
+    assert_true(#captured == 1 and captured[1].seconds == 0.2, "guard window is exactly the 0.2s timer")
+    captured[1].callback() -- guard expires
+    assert_true(capturedCanSelect() == true, "clicks select again after the guard expires")
+    PlayerSpellsFrame = savedPSF
+    addonNamespace.ClearActiveButtons()
+end
+
+-- Test 73: CancelDrag / FinishDrag with no gesture are silent no-ops
+do
+    local specID = 730
+    local pane = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        configIDToName = {},
+        configIDs = {},
+        LoadSystem = { possibleSelections = { 1, 2 } },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = pane }
+    local chatBase = #DEFAULT_CHAT_FRAME.messages
+    local okCancel = pcall(addonNamespace.CancelDrag)
+    local okFinish = pcall(addonNamespace.FinishDrag)
+    assert_true(okCancel and okFinish, "idle cancel/finish never raise")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 1, 2 }, "idle finish writes nothing")
+    assert_true(#DEFAULT_CHAT_FRAME.messages == chatBase, "idle paths report nothing")
+    PlayerSpellsFrame = savedPSF
+end
+
+-- Test 74: potential-drag released without moving writes nothing
+do
+    addonNamespace.ClearActiveButtons()
+    local b = CreateFrame("Button", "NoMoveBtn")
+    b:SetRect(50, 200, 200, 20)
+    b:Show()
+    addonNamespace.SetupLoadoutButton(b, { GetData = function() return 741 end, SetCanSelect = function() end }, nil, 741)
+    local evFrame = nil
+    for _, f in ipairs(mockFrames) do
+        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
+    end
+    cursorX, cursorY = 100, 100
+    leftMouseDown = true
+    b.scripts["OnMouseDown"](b, "LeftButton")
+    -- Release in place: the OnMouseUp post-hook clears potentialDrag, no drag began
+    leftMouseDown = false
+    b.scripts["OnMouseUp"](b, "LeftButton")
+    assert_true(b:GetAlpha() == 1.0, "press-and-release without moving never dims")
+    addonNamespace.CancelDrag()
+end
+
+-- Test 75: drag threshold boundary -- exactly 5px does not start, just over does
+do
+    addonNamespace.ClearActiveButtons()
+    local b = CreateFrame("Button", "BoundaryBtn")
+    b:SetRect(50, 200, 200, 20)
+    b:Show()
+    addonNamespace.SetupLoadoutButton(b, { GetData = function() return 751 end, SetCanSelect = function() end }, nil, 751)
+    local evFrame = nil
+    for _, f in ipairs(mockFrames) do
+        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
+    end
+    -- Arm at origin via the mock cursor (GetCursorPosition returns cursorX/Y)
+    cursorX, cursorY = 100, 100
+    leftMouseDown = true
+    b.scripts["OnMouseDown"](b, "LeftButton")
+    cursorX, cursorY = 103, 104 -- dx=3, dy=4 -> 9+16=25, NOT > 25
+    evFrame.scripts["OnUpdate"](evFrame, 0.016)
+    assert_true(b:GetAlpha() == 1.0, "exactly 5px does not start a drag")
+    cursorX, cursorY = 103, 105 -- 9+25=34 > 25
+    evFrame.scripts["OnUpdate"](evFrame, 0.016)
+    assert_true(b:GetAlpha() == 0.35, "just over 5px starts the drag")
+    leftMouseDown = false
+    addonNamespace.CancelDrag()
+end
+
+-- Test 76: populated frame name cache is used directly (no C_Traits needed)
+do
+    local frame = { configIDToName = { [11] = "Cached" } }
+    local savedTraits = C_Traits
+    C_Traits = nil
+    local map = addonNamespace.GetConfigIDToName(frame, { 11 })
+    assert_true(map == frame.configIDToName, "frame cache returned by reference")
+    assert_eq(map[11], "Cached", "cached name resolves without C_Traits")
+    C_Traits = savedTraits
+end
+
+-- Test 77: clean boot and steady-state ops report nothing (zero-chat rule)
+do
+    local pane = {
+        GetSpecID = function() return 250 end,
+        IsInspecting = function() return false end,
+        configIDToName = {},
+        configIDs = {},
+        HookScript = function() end,
+        LoadSystem = {
+            possibleSelections = { 1 },
+            GetDropdown = function(self) return nil end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = pane }
+    local chatBase = #DEFAULT_CHAT_FRAME.messages
+    addonNamespace.EnsureInit()
+    addonNamespace.Reconcile()
+    addonNamespace.UpdateResetButton()
+    assert_true(#DEFAULT_CHAT_FRAME.messages == chatBase, "steady-state ops stay silent")
+    PlayerSpellsFrame = savedPSF
+end
+
+-- Test 78: ADDON_LOADED routing (talent UI late-load installs, strangers ignored)
+do
+    local pane = {
+        GetSpecID = function() return 250 end,
+        IsInspecting = function() return false end,
+        configIDToName = {},
+        configIDs = {},
+        HookScript = function(self, script, hook)
+            self.hooked = (self.hooked or 0) + 1
+        end,
+        LoadSystem = {
+            possibleSelections = { 1 },
+            GetDropdown = function(self) return nil end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = pane }
+    local evFrame = nil
+    for _, f in ipairs(mockFrames) do
+        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
+    end
+    addonNamespace._ResetHookStateForTest()
+    pane.hooked = 0
+    evFrame.scripts["OnEvent"](evFrame, "ADDON_LOADED", "SomeStrangerAddon")
+    assert_true((pane.hooked or 0) == 0, "unrelated ADDON_LOADED installs nothing")
+    evFrame.scripts["OnEvent"](evFrame, "ADDON_LOADED", "Blizzard_PlayerSpells")
+    assert_true((pane.hooked or 0) == 1, "late talent UI load installs the pane hook")
+    evFrame.scripts["OnEvent"](evFrame, "ADDON_LOADED", "Blizzard_ClassTalentUI")
+    assert_true((pane.hooked or 0) == 1, "second talent UI load does not double-install")
+    PlayerSpellsFrame = savedPSF
+end
+
+-- Test 79: SaveOrder without a name map saves the order with empty names
+do
+    local pKey = addonNamespace.GetPlayerKey()
+    addonNamespace.SaveOrder(pKey, 790, { 3, 1, 2 }, nil)
+    local back = addonNamespace.GetSavedOrder(pKey, 790)
+    assert_table_eq(back.order, { 3, 1, 2 }, "order saved without names")
+    assert_true(type(back.names) == "table" and next(back.names) == nil, "names default to empty")
+    assert_table_eq(addonNamespace.SortConfigIDs(790, { 1, 2, 3 }, {}), { 3, 1, 2 }, "nameless order still sorts")
+    ReorderTalentLoadoutsDB[pKey][790] = nil
+end
+
+-- Test 80: announced reset prints exactly one chat line (the only notice path)
+do
+    local specID = 800
+    local pKey = addonNamespace.GetPlayerKey()
+    ReorderTalentLoadoutsDB[pKey] = ReorderTalentLoadoutsDB[pKey] or {}
+    ReorderTalentLoadoutsDB[pKey][specID] = { order = { 2, 1 }, names = {} }
+    local pane = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        configIDToName = {},
+        configIDs = {},
+        LoadSystem = { possibleSelections = { 1, 2 } },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = pane }
+    local chatBase = #DEFAULT_CHAT_FRAME.messages
+    assert_true(addonNamespace.ResetCurrentSpecOrder(true), "announced reset reports success")
+    assert_true(#DEFAULT_CHAT_FRAME.messages == chatBase + 1, "announced reset prints exactly one line")
+    local line = DEFAULT_CHAT_FRAME.messages[#DEFAULT_CHAT_FRAME.messages]
+    assert_true(line:find("Loadout order reset") ~= nil, "reset notice states what happened")
+    PlayerSpellsFrame = savedPSF
+end
+
+-- Test 81: re-entrant StartDrag is a no-op (first gesture wins)
+do
+    addonNamespace.ClearActiveButtons()
+    local b1 = CreateFrame("Button", "ReenterB1")
+    b1:SetRect(50, 200, 200, 20)
+    local b2 = CreateFrame("Button", "ReenterB2")
+    b2:SetRect(50, 180, 200, 20)
+    addonNamespace.SetupLoadoutButton(b1, { GetData = function() return 811 end, SetCanSelect = function() end }, nil, 811)
+    addonNamespace.SetupLoadoutButton(b2, { GetData = function() return 812 end, SetCanSelect = function() end }, nil, 812)
+    addonNamespace.StartDrag(b1)
+    addonNamespace.StartDrag(b2) -- ignored while b1's drag is active
+    assert_true(b1:GetAlpha() == 0.35, "first drag still active")
+    assert_true(b2:GetAlpha() == 1.0, "second drag never arms")
+    addonNamespace.CancelDrag()
+end
+
+-- Test 82: repeated menu installs never duplicate the registry or the hooks
+do
+    addonNamespace.ClearActiveButtons()
+    local b = CreateFrame("Button", "DupBtn")
+    local desc = { GetData = function() return 821 end, SetCanSelect = function() end }
+    addonNamespace.SetupLoadoutButton(b, desc, nil, 821)
+    addonNamespace.SetupLoadoutButton(b, desc, nil, 821)
+    addonNamespace.SetupLoadoutButton(b, desc, nil, 822) -- pool reuse for another entry
+    -- FindTrackedEntry returns the FIRST match: reporting 822 here proves no
+    -- stale 821 duplicate precedes it (same argument as Test 16).
+    local entry = addonNamespace.FindTrackedEntry(b)
+    assert_true(entry ~= nil and entry.configID == 822, "latest install wins on pool reuse (no stale duplicate)")
+    assert_true(b.rtDragHooked == true, "drag post-hooks installed exactly once (guard flag)")
+end
+
+-- Test 83: rows without readable rects degrade to a no-op (no crash, no write)
+do
+    local specID = 830
+    local pane = PlayerSpellsFrame.TalentsFrame
+    local savedSelections = pane.LoadSystem.possibleSelections
+    pane.LoadSystem.possibleSelections = { 831, 832 }
+    addonNamespace.ClearActiveButtons()
+    local b1 = CreateFrame("Button", "NilRectB1")
+    b1.GetRect = function() return nil end -- unreadable row (mirrors marked-object nil)
+    local b2 = CreateFrame("Button", "NilRectB2")
+    b2.GetRect = function() return nil end
+    addonNamespace.SetupLoadoutButton(b1, { GetData = function() return 831 end, SetCanSelect = function() end }, nil, 831)
+    addonNamespace.SetupLoadoutButton(b2, { GetData = function() return 832 end, SetCanSelect = function() end }, nil, 832)
+    local okDrag = pcall(addonNamespace.StartDrag, b1)
+    assert_true(okDrag, "drag start with nil rects does not raise")
+    local okUpdate = pcall(addonNamespace.UpdateDrag)
+    assert_true(okUpdate, "drag update with nil rects does not raise")
+    addonNamespace.FinishDrag()
+    assert_true(b1:GetAlpha() == 1.0, "visuals restored after nil-rect drop")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 831, 832 }, "nil-rect drop writes nothing")
+    pane.LoadSystem.possibleSelections = savedSelections
+end
+
+-- Test 84: mid-drag loss of the talent frame cleans up without raising
+do
+    addonNamespace.ClearActiveButtons()
+    local b = CreateFrame("Button", "LostFrameBtn")
+    b:SetRect(50, 200, 200, 20)
+    addonNamespace.SetupLoadoutButton(b, { GetData = function() return 841 end, SetCanSelect = function() end }, nil, 841)
+    addonNamespace.StartDrag(b)
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = nil -- frame torn down mid-gesture (reload/zone edge)
+    local okFinish = pcall(addonNamespace.FinishDrag)
+    assert_true(okFinish, "finish with no talent frame does not raise")
+    assert_true(b:GetAlpha() == 1.0, "visuals restored even with no frame")
+    PlayerSpellsFrame = savedPSF
+    addonNamespace.ClearActiveButtons()
+end
+
+-- Test 85: drop falls back to CloseMenu/OpenMenu when GenerateMenu is absent
+do
+    local specID = 850
+    local pKey = addonNamespace.GetPlayerKey()
+    local closeCalled, openCalled = false, false
+    local pane = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        configIDToName = { [851] = "A", [852] = "B" },
+        configIDs = { 851, 852 },
+        LoadSystem = {
+            possibleSelections = { 851, 852 },
+            dropdown = {
+                CloseMenu = function(self) closeCalled = true end,
+                OpenMenu = function(self) openCalled = true end,
+            },
+            GetDropdown = function(self) return self.dropdown end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = pane }
+    addonNamespace.ClearActiveButtons()
+    local b1 = CreateFrame("Button", "FbB1")
+    b1:SetRect(50, 200, 200, 20)
+    local b2 = CreateFrame("Button", "FbB2")
+    b2:SetRect(50, 180, 200, 20)
+    addonNamespace.SetupLoadoutButton(b1, { GetData = function() return 851 end, SetCanSelect = function() end }, nil, 851)
+    addonNamespace.SetupLoadoutButton(b2, { GetData = function() return 852 end, SetCanSelect = function() end }, nil, 852)
+    addonNamespace.StartDrag(b2)
+    cursorX, cursorY = 100, 215 -- above b1: drop on top
+    addonNamespace.UpdateDrag()
+    addonNamespace.FinishDrag()
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 852, 851 }, "drop persists via the fallback path")
+    assert_true(closeCalled and openCalled, "dropdown cycled CloseMenu/OpenMenu without GenerateMenu")
+    local saved = addonNamespace.GetSavedOrder(pKey, specID)
+    assert_table_eq(saved.order, { 852, 851 }, "fallback drop persisted to the DB")
+    PlayerSpellsFrame = savedPSF
+    ReorderTalentLoadoutsDB[pKey][specID] = nil
+end
+
+-- Test 86: full press-hold-release cycle through OnUpdate persists the drop
+do
+    local specID = 860
+    local pKey = addonNamespace.GetPlayerKey()
+    local pane = {
+        GetSpecID = function() return specID end,
+        IsInspecting = function() return false end,
+        configIDToName = { [861] = "A", [862] = "B" },
+        configIDs = { 861, 862 },
+        LoadSystem = {
+            possibleSelections = { 861, 862 },
+            GetDropdown = function(self) return nil end,
+        },
+    }
+    local savedPSF = PlayerSpellsFrame
+    PlayerSpellsFrame = { TalentsFrame = pane }
+    addonNamespace.ClearActiveButtons()
+    local b1 = CreateFrame("Button", "CycleB1")
+    b1:SetRect(50, 200, 200, 20)
+    b1:Show()
+    local b2 = CreateFrame("Button", "CycleB2")
+    b2:SetRect(50, 180, 200, 20)
+    b2:Show()
+    addonNamespace.SetupLoadoutButton(b1, { GetData = function() return 861 end, SetCanSelect = function() end }, nil, 861)
+    addonNamespace.SetupLoadoutButton(b2, { GetData = function() return 862 end, SetCanSelect = function() end }, nil, 862)
+    local evFrame = nil
+    for _, f in ipairs(mockFrames) do
+        if f.name == "ReorderTalentLoadoutsEventFrame" then evFrame = f; break end
+    end
+    -- Press on b1, hold, drag below b2, release: OnUpdate drives the whole gesture
+    cursorX, cursorY = 100, 210
+    leftMouseDown = true
+    b1.scripts["OnMouseDown"](b1, "LeftButton")
+    cursorX, cursorY = 100, 150 -- below every row: drop at the end
+    evFrame.scripts["OnUpdate"](evFrame, 0.016)
+    assert_true(b1:GetAlpha() == 0.35, "hold past threshold starts the drag via OnUpdate")
+    leftMouseDown = false
+    evFrame.scripts["OnUpdate"](evFrame, 0.016) -- release finishes the drag
+    assert_true(b1:GetAlpha() == 1.0, "release restores visuals via OnUpdate")
+    assert_table_eq(pane.LoadSystem.possibleSelections, { 862, 861 }, "OnUpdate cycle persists the drop")
+    local saved = addonNamespace.GetSavedOrder(pKey, specID)
+    assert_table_eq(saved.order, { 862, 861 }, "OnUpdate cycle persists to the DB")
+    PlayerSpellsFrame = savedPSF
+    ReorderTalentLoadoutsDB[pKey][specID] = nil
+    addonNamespace.ClearActiveButtons()
 end
 
 print(string.format("\nTest Results: %d Passed, %d Failed", passed, failed))

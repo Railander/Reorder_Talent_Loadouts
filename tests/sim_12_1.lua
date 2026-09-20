@@ -452,7 +452,7 @@ dropdown:GenerateMenu();
 local count3 = MenuElementCount();
 ok(count3 ~= nil and count3 >= 4, "menu still generates", count3);
 
-print("\n== Sim 5: fresh frame open (no-hook design: poller/OnRefreshLoadoutOptions applies saved order) ==");
+print("\n== Sim 5: fresh frame open (no-hook design: OnRefreshLoadoutOptions applies saved order) ==");
 print("  [trace] MENU_CLASS_TALENT_PROFILE modify-callback invocations so far: " .. modifyCalls);
 for _, h in ipairs(hookCalls) do print("  [trace] hooksecurefunc -> " .. h); end
 do
@@ -468,8 +468,8 @@ end
 talentsFrame.configIDs = nil;
 talentsFrame.configIDToName = nil;
 talentsFrame:RefreshLoadoutOptions();
--- No Blizzard Lua method is hooked; the poller invokes OnRefreshLoadoutOptions from addon
--- execution once it sees the (re)populated possibleSelections table.
+-- No Blizzard Lua method is hooked; OnRefreshLoadoutOptions runs from addon
+-- execution once the (re)populated possibleSelections table is visible.
 ns.OnRefreshLoadoutOptions(talentsFrame);
 local sorted5 = {};
 for i, id in ipairs(loadSystem.possibleSelections) do sorted5[i] = id; end

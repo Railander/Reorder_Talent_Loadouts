@@ -247,5 +247,24 @@ do
     ok(#env.taintedHooks == 0, "addon never hooksecurefunc'd a Blizzard Lua method");
 end
 
+env.rawPrint("\n== R6: movement + stray events while flagged: reconcile applies, locks absent ==");
+do
+    ns.SaveOrder(ns.GetPlayerKey(), SPEC_ID, { 33, 11, 22 }, { [11] = "A", [22] = "B", [33] = "C" });
+    loadSystem.possibleSelections = { 11, 22, 33 }; -- scramble back to default
+    env:ClearViolations();
+    env:FireEvent("PLAYER_STARTED_MOVING"); -- first input after reload
+    ok(table.concat(loadSystem.possibleSelections, ",") == "33,11,22",
+        "first movement reconciles while flagged", table.concat(loadSystem.possibleSelections, ","));
+    ok(#env.restrictionViolations == 0, "movement reconcile logs nothing");
+    -- Stray lock-machinery events are safe no-ops (nothing registered for them).
+    local ef = eventFrame();
+    local okRegen = pcall(ef.scripts.OnEvent, ef, "PLAYER_REGEN_DISABLED");
+    local okRestr = pcall(ef.scripts.OnEvent, ef, "ADDON_RESTRICTION_STATE_CHANGED", 2, 2);
+    ok(okRegen and okRestr, "stray regen/restriction events never raise");
+    ok(table.concat(loadSystem.possibleSelections, ",") == "33,11,22",
+        "stray events write nothing", table.concat(loadSystem.possibleSelections, ","));
+    ok(#env.restrictionViolations == 0, "stray events log nothing");
+end
+
 env.rawPrint(("\nTest Results: %d passed, %d failed"):format(PASS, FAIL));
 if FAIL > 0 then os.exit(1); end
