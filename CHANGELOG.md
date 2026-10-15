@@ -1,5 +1,8 @@
 # Reorder Talent Loadouts Changelog
 
+## v1.8.1
+- Loadouts now work in World of Warcraft: Midnight (12.1.5). Nothing changes in game.
+
 ## v1.8.0
 - Dragging and reset now work everywhere, including combat, Mythic+, and PvP — no more pausing while protected, no chat notices.
 
