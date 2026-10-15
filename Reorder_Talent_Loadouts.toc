@@ -1,4 +1,4 @@
-## Interface: 120000, 120100
+## Interface: 120000, 120100, 120105
 ## Version: @project-version@
 ## Title: Reorder Talent Loadouts
 ## Notes: Super lightweight addon that adds drag-and-drop reordering to the talent loadout dropdown.
