@@ -1,5 +1,8 @@
 # Reorder Talent Loadouts Changelog
 
+## v1.8.2
+- The addon now does no work at all between drags (it used to run a tiny check every frame).
+
 ## v1.8.1
 - Loadouts now work in World of Warcraft: Midnight (12.1.5). Nothing changes in game.
 

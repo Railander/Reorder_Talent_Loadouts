@@ -63,6 +63,7 @@ local dragStartX, dragStartY = 0, 0;
 local currentDropTargetIndex = nil;
 local trackedButtons = {}; -- addon-side registry of loadout menu buttons: { button, configID }; never written onto Blizzard frames
 local UpdateResetButton; -- forward declaration: refreshes reset-button visibility (defined near the reset button)
+local ArmDragPump; -- forward declaration: attaches the drag OnUpdate (defined with the event frame)
 
 -- ----------------------------------------------------------------------------
 -- Utility Functions
@@ -406,6 +407,7 @@ local function StartDragInner(button)
 
     -- Dim the source row to visually distinguish it
     button:SetAlpha(0.35);
+    ArmDragPump();
 
     ns.UpdateDrag();
 end
@@ -679,6 +681,7 @@ function ns.SetupLoadoutButton(button, description, menu, configID)
                     return;
                 end
                 potentialDrag = true;
+                ArmDragPump();
                 dragSourceButton = self;
                 local e = ns.FindTrackedEntry(self);
                 dragSourceConfigID = e and e.configID or nil;
@@ -1298,8 +1301,12 @@ end
 
 local function OnAddonUpdate(self, elapsed)
     -- OnUpdate only services click-and-hold drag state; list reconciliation is event-driven.
-    -- Idle frames return immediately: zero per-frame cost outside a drag gesture.
-    if not potentialDrag and not isDragging then return end
+    -- It exists only while a press or drag is in flight (ArmDragPump attaches it) and
+    -- detaches itself once both end: zero per-frame cost outside a drag gesture.
+    if not potentialDrag and not isDragging then
+        self:SetScript("OnUpdate", nil);
+        return;
+    end
 
     if potentialDrag and not isDragging then
         if IsMouseButtonDown and IsMouseButtonDown("LeftButton") then
@@ -1318,10 +1325,18 @@ local function OnAddonUpdate(self, elapsed)
     if isDragging then
         if IsMouseButtonDown and not IsMouseButtonDown("LeftButton") then
             ns.FinishDrag();
-            return;
+        else
+            ns.UpdateDrag();
         end
+    end
+    if not potentialDrag and not isDragging then
+        self:SetScript("OnUpdate", nil);
+    end
+end
 
-        ns.UpdateDrag();
+ArmDragPump = function()
+    if eventFrame then
+        eventFrame:SetScript("OnUpdate", OnAddonUpdate);
     end
 end
 
@@ -1344,7 +1359,6 @@ RegisterAddonEvents = function()
     eventFrame:RegisterEvent("TRAIT_CONFIG_DELETED");
     eventFrame:RegisterEvent("ACTIVE_PLAYER_SPECIALIZATION_CHANGED");
     eventFrame:SetScript("OnEvent", OnAddonEvent);
-    eventFrame:SetScript("OnUpdate", OnAddonUpdate);
 end
 
 RegisterAddonEvents();
