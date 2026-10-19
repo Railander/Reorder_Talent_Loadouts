@@ -62,6 +62,7 @@ local dragSourceButton = nil;
 local dragStartX, dragStartY = 0, 0;
 local currentDropTargetIndex = nil;
 local trackedButtons = {}; -- addon-side registry of loadout menu buttons: { button, configID }; never written onto Blizzard frames
+local hookedButtons = setmetatable({}, { __mode = "k" }); -- pooled menu buttons that already carry our drag post-hooks
 local UpdateResetButton; -- forward declaration: refreshes reset-button visibility (defined near the reset button)
 local ArmDragPump; -- forward declaration: attaches the drag OnUpdate (defined with the event frame)
 
@@ -151,7 +152,9 @@ function ns.GetSavedOrder(playerKey, specID)
     return nil;
 end
 
-function ns.SaveOrder(playerKey, specID, orderList, configIDToName)
+-- fallbackNames supplies names for entries the current names map lacks (saved
+-- loadouts kept while absent from the visible list).
+function ns.SaveOrder(playerKey, specID, orderList, configIDToName, fallbackNames)
     if not playerKey or not specID or not orderList then return end
 
     -- A corrupt (non-table) character bucket is replaced, not indexed into.
@@ -160,11 +163,10 @@ function ns.SaveOrder(playerKey, specID, orderList, configIDToName)
     end
 
     local namesMap = {};
-    if configIDToName then
-        for _, id in ipairs(orderList) do
-            if configIDToName[id] then
-                namesMap[id] = configIDToName[id];
-            end
+    for _, id in ipairs(orderList) do
+        local name = (configIDToName and configIDToName[id]) or (fallbackNames and fallbackNames[id]);
+        if name then
+            namesMap[id] = name;
         end
     end
 
@@ -179,6 +181,76 @@ function ns.SaveOrder(playerKey, specID, orderList, configIDToName)
     };
 end
 
+local function StarterBuildID()
+    return Constants and Constants.TraitConsts and Constants.TraitConsts.STARTER_BUILD_TRAIT_CONFIG_ID;
+end
+
+-- Set of the spec's real loadouts from the client, or nil when the read fails or
+-- comes back empty (degraded) -- nil means "unknown", never "everything deleted".
+local function GetLiveConfigSet(specID)
+    if not specID or not C_ClassTalents or not C_ClassTalents.GetConfigIDsBySpecID then
+        return nil;
+    end
+    local ok, ids = pcall(C_ClassTalents.GetConfigIDsBySpecID, specID);
+    if not ok or type(ids) ~= "table" or #ids == 0 then
+        return nil;
+    end
+    local set = {};
+    for _, id in ipairs(ids) do set[id] = true; end
+    return set;
+end
+
+-- The persisted order is the visible order plus every saved entry that is merely
+-- absent from it right now (a partial or degraded population), each kept right
+-- after its saved predecessor. isGone(id) marks entries that must be dropped.
+function ns.MergeAbsent(visible, savedOrder, isGone)
+    local inVisible = {};
+    for _, id in ipairs(visible) do inVisible[id] = true; end
+    local after = {};
+    local anchor = false; -- false = before the first visible entry
+    for _, id in ipairs(savedOrder or {}) do
+        if inVisible[id] then
+            anchor = id;
+        elseif not isGone(id) then
+            after[anchor] = after[anchor] or {};
+            table.insert(after[anchor], id);
+            inVisible[id] = true; -- duplicates in a hand-edited DB keep one copy
+        end
+    end
+    local merged = {};
+    for _, id in ipairs(after[false] or {}) do table.insert(merged, id); end
+    for _, id in ipairs(visible) do
+        table.insert(merged, id);
+        for _, kept in ipairs(after[id] or {}) do table.insert(merged, kept); end
+    end
+    return merged;
+end
+
+-- Saved entries absent from the visible list are dropped from the DB only when the
+-- client confirms they no longer exist (or they were re-identified by name).
+local function MakeIsGone(specID, replaced)
+    local live, queried = nil, false;
+    return function(id)
+        if replaced and replaced[id] then return true; end
+        if not queried then
+            queried = true;
+            live = GetLiveConfigSet(specID);
+        end
+        return live ~= nil and not live[id];
+    end;
+end
+
+local function NamesChanged(order, savedNames, configIDToName)
+    if not configIDToName then return false; end
+    for _, id in ipairs(order) do
+        local name = configIDToName[id];
+        if name and (type(savedNames) ~= "table" or savedNames[id] ~= name) then
+            return true;
+        end
+    end
+    return false;
+end
+
 function ns.SortConfigIDs(specID, currentConfigIDs, configIDToName)
     if not currentConfigIDs or #currentConfigIDs <= 1 then
         return currentConfigIDs;
@@ -190,9 +262,10 @@ function ns.SortConfigIDs(specID, currentConfigIDs, configIDToName)
     end
 
     local saved = ns.GetSavedOrder(playerKey, specID);
-    if not saved or not saved.order or #saved.order == 0 then
+    if not saved or #saved.order == 0 then
         return currentConfigIDs;
     end
+    local savedNames = type(saved.names) == "table" and saved.names or nil;
 
     local currentSet = {};
     local nameToCurrentID = {};
@@ -205,20 +278,17 @@ function ns.SortConfigIDs(specID, currentConfigIDs, configIDToName)
 
     local result = {};
     local placed = {};
-    local changed = false;
+    local replaced = {};
 
-    -- 1. First pass: Place all saved IDs in their saved order
+    -- 1. Place all saved IDs in their saved order
     for _, savedID in ipairs(saved.order) do
         local idToPlace = nil;
         if currentSet[savedID] then
             idToPlace = savedID;
-        elseif saved.names and saved.names[savedID] and nameToCurrentID[saved.names[savedID]] then
+        elseif savedNames and savedNames[savedID] and nameToCurrentID[savedNames[savedID]] then
             -- ConfigID changed (e.g. server transfer or patch), but name matched!
-            local newID = nameToCurrentID[saved.names[savedID]];
-            if currentSet[newID] and not placed[newID] then
-                idToPlace = newID;
-                changed = true;
-            end
+            idToPlace = nameToCurrentID[savedNames[savedID]];
+            replaced[savedID] = true;
         end
 
         if idToPlace and not placed[idToPlace] then
@@ -227,23 +297,29 @@ function ns.SortConfigIDs(specID, currentConfigIDs, configIDToName)
         end
     end
 
-    -- 2. Second pass: Append any current IDs not present in saved order (new loadouts)
+    -- 2. Append current IDs missing from the saved order (new loadouts). Like
+    -- Blizzard's default list, they go above a trailing Starter Build.
+    local starterID = StarterBuildID();
+    local insertAt = nil;
+    if starterID ~= nil and result[#result] == starterID then
+        insertAt = #result;
+    end
     for _, id in ipairs(currentConfigIDs) do
         if not placed[id] then
-            table.insert(result, id);
+            if insertAt then
+                table.insert(result, insertAt, id);
+                insertAt = insertAt + 1;
+            else
+                table.insert(result, id);
+            end
             placed[id] = true;
-            changed = true;
         end
     end
 
-    -- If any saved IDs were deleted, or count changed, mark changed so DB is purged
-    if #saved.order ~= #result then
-        changed = true;
-    end
-
-    -- If any IDs were updated/added/purged, update the saved DB
-    if changed and #result > 0 then
-        ns.SaveOrder(playerKey, specID, result, configIDToName);
+    -- 3. Persist when the order or any name moved on (no rewrite churn otherwise).
+    local persisted = ns.MergeAbsent(result, saved.order, MakeIsGone(specID, replaced));
+    if not ns.ArraysEqual(persisted, saved.order) or NamesChanged(result, savedNames, configIDToName) then
+        ns.SaveOrder(playerKey, specID, persisted, configIDToName, savedNames);
     end
 
     return result;
@@ -393,17 +469,17 @@ end
 -- ----------------------------------------------------------------------------
 
 local function StartDragInner(button)
-    if isDragging or not button or not ns.FindTrackedEntry(button) then
+    local entry = button and ns.FindTrackedEntry(button);
+    if isDragging or not entry then
         return;
     end
 
     CreateUIElements();
 
-    local entry = ns.FindTrackedEntry(button);
     isDragging = true;
     potentialDrag = false;
     dragSourceButton = button;
-    dragSourceConfigID = entry and entry.configID or nil;
+    dragSourceConfigID = entry.configID;
 
     -- Dim the source row to visually distinguish it
     button:SetAlpha(0.35);
@@ -494,17 +570,23 @@ function ns.UpdateDrag()
     SafeInvoke("updateDrag", UpdateDragInner);
 end
 
-local function FinishDragInner()
-    if not isDragging and not potentialDrag then
-        return;
-    end
-
-    local wasDragging = isDragging;
+-- Ends the press/drag gesture: clears all drag state and restores visuals. Returns
+-- what the drop needs (whether a drag was live, its source and target).
+local function EndGesture()
+    local result = {
+        wasDragging = isDragging,
+        sourceButton = dragSourceButton,
+        sourceConfigID = dragSourceConfigID,
+        targetIndex = currentDropTargetIndex,
+    };
     isDragging = false;
     potentialDrag = false;
-    justFinishedDragging = true;
+    dragSourceButton = nil;
+    dragSourceConfigID = nil;
+    currentDropTargetIndex = nil;
 
-    -- Suppress click handling for a brief moment after releasing drag
+    -- Suppress click selection/sound for a brief moment after releasing
+    justFinishedDragging = true;
     if C_Timer and C_Timer.After then
         C_Timer.After(0.2, function()
             justFinishedDragging = false;
@@ -514,64 +596,63 @@ local function FinishDragInner()
     end
 
     if insertionLine then insertionLine:Hide(); end
-
-    if dragSourceButton then
-        dragSourceButton:SetAlpha(1.0);
+    if result.sourceButton then
+        result.sourceButton:SetAlpha(1.0);
     end
+    return result;
+end
 
-    if not wasDragging or not currentDropTargetIndex or not dragSourceConfigID then
-        dragSourceButton = nil;
-        dragSourceConfigID = nil;
-        currentDropTargetIndex = nil;
+local function FinishDragInner()
+    if not isDragging and not potentialDrag then
         return;
     end
 
-    local talentsFrame = GetTalentsFrame(dragSourceButton, true);
-    local loadSystem = GetLoadSystem(dragSourceButton, true);
+    local drop = EndGesture();
+    if not drop.wasDragging or not drop.targetIndex or not drop.sourceConfigID then
+        return;
+    end
+
+    local talentsFrame = GetTalentsFrame(drop.sourceButton, true);
+    local loadSystem = GetLoadSystem(drop.sourceButton, true);
     if not talentsFrame or not loadSystem then
-        dragSourceButton = nil;
-        dragSourceConfigID = nil;
-        currentDropTargetIndex = nil;
         return;
     end
 
     local possibleSelections = loadSystem.possibleSelections;
     if not possibleSelections or #possibleSelections <= 1 then
-        dragSourceButton = nil;
-        dragSourceConfigID = nil;
-        currentDropTargetIndex = nil;
         return;
     end
 
     -- Find source index
     local fromIndex = nil;
     for i, id in ipairs(possibleSelections) do
-        if id == dragSourceConfigID then
+        if id == drop.sourceConfigID then
             fromIndex = i;
             break;
         end
     end
-
-    local toIndex = currentDropTargetIndex;
-    dragSourceButton = nil;
-    dragSourceConfigID = nil;
-    currentDropTargetIndex = nil;
-
     if not fromIndex then return end
 
     -- Calculate new list
-    local newList, moved = ns.CalculateNewOrder(CopyTable(possibleSelections), fromIndex, toIndex);
+    local newList, moved = ns.CalculateNewOrder(CopyTable(possibleSelections), fromIndex, drop.targetIndex);
     if not moved then
         return;
     end
 
-    -- Persist the new order
+    -- Persist the new order (saved loadouts absent from the list right now keep their slot)
     local specID = ns.GetSpecID(talentsFrame);
     local configIDToName = ns.GetConfigIDToName(talentsFrame, newList);
 
     local playerKey = ns.GetPlayerKey();
     if playerKey and specID then
-        ns.SaveOrder(playerKey, specID, newList, configIDToName);
+        local saved = ns.GetSavedOrder(playerKey, specID);
+        local persisted = newList;
+        local savedNames = nil;
+        if saved then
+            savedNames = type(saved.names) == "table" and saved.names or nil;
+            persisted = ns.MergeAbsent(newList, saved.order, MakeIsGone(specID));
+        end
+        ns.SaveOrder(playerKey, specID, persisted, configIDToName, savedNames);
     end
 
     -- Update loadSystem selections in place without touching talentsFrame.configIDs
@@ -604,26 +685,7 @@ end
 
 function ns.CancelDrag()
     if isDragging or potentialDrag then
-        isDragging = false;
-        potentialDrag = false;
-        justFinishedDragging = true;
-        if C_Timer and C_Timer.After then
-            C_Timer.After(0.2, function()
-                justFinishedDragging = false;
-            end);
-        else
-            justFinishedDragging = false;
-        end
-
-        if insertionLine then insertionLine:Hide(); end
-
-        if dragSourceButton then
-            dragSourceButton:SetAlpha(1.0);
-        end
-
-        dragSourceButton = nil;
-        dragSourceConfigID = nil;
-        currentDropTargetIndex = nil;
+        EndGesture();
     end
 end
 
@@ -651,13 +713,7 @@ end
 -- via HookScript (the sanctioned form -- runs after Blizzard's handlers, and verified
 -- working in-game on these menu buttons). We do not touch any other Blizzard frame.
 function ns.SetupLoadoutButton(button, description, menu, configID)
-    local entry = nil;
-    for i, e in ipairs(trackedButtons) do
-        if e.button == button then
-            entry = e;
-            break;
-        end
-    end
+    local entry = ns.FindTrackedEntry(button);
     if entry then
         entry.configID = configID; -- pooled button re-used for a different entry
     else
@@ -673,18 +729,20 @@ function ns.SetupLoadoutButton(button, description, menu, configID)
     if button.RegisterForDrag then
         button:RegisterForDrag("LeftButton");
     end
-    if button.HookScript and not button.rtDragHooked then
-        button.rtDragHooked = true;
+    -- Menu buttons are pooled across every menu in the game, so the hooks outlive
+    -- our dropdown: they act only while the button is a tracked loadout row.
+    if button.HookScript and not hookedButtons[button] then
+        hookedButtons[button] = true;
         button:HookScript("OnMouseDown", function(self, mouseButton)
             if mouseButton == "LeftButton" then
-                if IsMouseOverUtilityButton(self) then
+                local e = ns.FindTrackedEntry(self);
+                if not e or IsMouseOverUtilityButton(self) then
                     return;
                 end
                 potentialDrag = true;
                 ArmDragPump();
                 dragSourceButton = self;
-                local e = ns.FindTrackedEntry(self);
-                dragSourceConfigID = e and e.configID or nil;
+                dragSourceConfigID = e.configID;
                 dragStartX, dragStartY = GetCursorPosition();
             end
         end);
@@ -692,8 +750,10 @@ function ns.SetupLoadoutButton(button, description, menu, configID)
             if mouseButton == "LeftButton" then
                 if isDragging then
                     ns.FinishDrag();
-                else
+                elseif potentialDrag then
                     potentialDrag = false;
+                    dragSourceButton = nil;
+                    dragSourceConfigID = nil;
                 end
             end
         end);
@@ -991,7 +1051,7 @@ ns.ScheduleReconcile = ScheduleReconcile;
 -- dropdown. IMPORTANT (WoW 12.x taint rules): never call the frame's RefreshLoadoutOptions
 -- method from addon execution; its body invokes the restricted
 -- C_ClassTalents.GetConfigIDsBySpecID. The pure-Lua load system replica below is safe.
-function ns.ResetCurrentSpecOrder(announce)
+function ns.ResetCurrentSpecOrder()
     local talentsFrame = GetTalentsFrame();
     local specID = ns.GetSpecID(talentsFrame);
     local playerKey = ns.GetPlayerKey();
@@ -1015,16 +1075,25 @@ function ns.ResetCurrentSpecOrder(announce)
             end
             return nil;
         end
-        loadSystem:SetSelectionOptions(talentsFrame.configIDs, nameTranslation, NORMAL_FONT_COLOR, tooltipTranslation);
+        -- Merge-only: entries other addons injected stay, after Blizzard's defaults.
+        local defaults = {};
+        local isDefault = {};
+        for _, id in ipairs(talentsFrame.configIDs) do
+            table.insert(defaults, id);
+            isDefault[id] = true;
+        end
+        for _, id in ipairs(loadSystem.possibleSelections or {}) do
+            if not isDefault[id] then
+                table.insert(defaults, id);
+                isDefault[id] = true;
+            end
+        end
+        loadSystem:SetSelectionOptions(defaults, nameTranslation, NORMAL_FONT_COLOR, tooltipTranslation);
     end
 
     -- talentsFrame.configIDs may be stale/degraded (Blizzard's population); reconciliation
     -- merges in the ground truth right away and leaves the default (unsorted) order intact.
     ns.Reconcile();
-
-    if announce and DEFAULT_CHAT_FRAME then
-        DEFAULT_CHAT_FRAME:AddMessage("|cff00ccffReorder Talent Loadouts:|r Loadout order reset to default for this spec.");
-    end
     return true;
 end
 
@@ -1034,13 +1103,27 @@ local function ddOpen(dropdown)
     return dropdown and dropdown.IsMenuOpen and dropdown:IsMenuOpen();
 end
 
--- The button only makes sense when the current spec's order deviates from default,
--- i.e. a saved order exists in the DB.
-local function IsSavedOrderPresent()
-    local talentsFrame = GetTalentsFrame();
+-- The button only makes sense when the current spec's order deviates from default:
+-- a saved order exists AND the shown list differs from Blizzard's own order (a drag
+-- back to the default arrangement leaves nothing to reset).
+local function IsCustomOrderActive(talentsFrame, loadSystem)
     local specID = ns.GetSpecID(talentsFrame);
     local saved = ns.GetSavedOrder(ns.GetPlayerKey(), specID);
-    return saved ~= nil and saved.order ~= nil and #saved.order > 0;
+    if not saved or #saved.order == 0 then
+        return false;
+    end
+    local defaults = talentsFrame and talentsFrame.configIDs;
+    local shown = loadSystem and loadSystem.possibleSelections;
+    if type(defaults) ~= "table" or type(shown) ~= "table" or #defaults == 0 then
+        return true;
+    end
+    local isDefault = {};
+    for _, id in ipairs(defaults) do isDefault[id] = true; end
+    local shownDefaults = {};
+    for _, id in ipairs(shown) do
+        if isDefault[id] then table.insert(shownDefaults, id); end
+    end
+    return not ns.ArraysEqual(shownDefaults, defaults);
 end
 
 UpdateResetButton = function()
@@ -1053,7 +1136,7 @@ UpdateResetButton = function()
     local talentsFrame = GetTalentsFrame();
     local loadSystem = talentsFrame and talentsFrame.LoadSystem;
     local dropdown = loadSystem and loadSystem.GetDropdown and loadSystem:GetDropdown();
-    if ddOpen(dropdown) and IsSavedOrderPresent() then
+    if ddOpen(dropdown) and IsCustomOrderActive(talentsFrame, loadSystem) then
         resetButton:Show();
     else
         resetButton:Hide();
@@ -1100,7 +1183,7 @@ local function CreateResetButton(talentsFrame)
         end
         self:Hide();
         SafeInvoke("resetButton", function()
-            ns.ResetCurrentSpecOrder(false);
+            ns.ResetCurrentSpecOrder();
             if C_Timer and C_Timer.After then
                 C_Timer.After(0, function()
                     local tf = GetTalentsFrame();
@@ -1348,7 +1431,6 @@ RegisterAddonEvents = function()
     eventFrame:RegisterEvent("ADDON_LOADED");
     eventFrame:RegisterEvent("PLAYER_LOGIN");
     eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD");
-    eventFrame:RegisterEvent("PLAYER_STARTED_MOVING");
     -- Zone changes with a loading screen (ENTERING_WORLD above) and without:
     -- Blizzard repopulates the dropdown across them, so re-sort after each.
     eventFrame:RegisterEvent("ZONE_CHANGED");
@@ -1362,6 +1444,9 @@ RegisterAddonEvents = function()
 end
 
 RegisterAddonEvents();
+-- First movement after login is a one-shot (unregisters itself on fire), so it is
+-- armed once here and never by the idempotent re-registration above.
+eventFrame:RegisterEvent("PLAYER_STARTED_MOVING");
 
 -- Register with Blizzard Menu framework (available in 11.0+).
 if Menu and Menu.ModifyMenu then

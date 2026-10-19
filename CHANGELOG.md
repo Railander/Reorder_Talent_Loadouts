@@ -1,5 +1,12 @@
 # Reorder Talent Loadouts Changelog
 
+## v1.9.0
+- Your saved order no longer forgets loadouts that briefly go missing from the list — they return to their spot.
+- New loadouts now appear above Starter Build, like the default list.
+- The reset button only appears when your order actually differs from the default.
+- Clicking entries in other dropdown menus no longer wakes the addon.
+- Renamed loadouts keep their saved position more reliably.
+
 ## v1.8.2
 - The addon now does no work at all between drags (it used to run a tiny check every frame).
 
