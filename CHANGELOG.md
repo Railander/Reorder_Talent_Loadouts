@@ -1,5 +1,14 @@
 # Reorder Talent Loadouts Changelog
 
+## v1.10.0
+- Fixed the player cast bar occasionally disappearing until the interface was reloaded after changing loadouts (World of Warcraft: Midnight).
+- Fixed the Starter Build losing its saved position after a temporary glitch in the loadout list.
+- Fixed loadout positions shifting when one of two identically named loadouts was deleted.
+- Fixed a rare case where a loadout could be dropped at a stale position if the list became unreadable mid-drag.
+- Fixed drag-and-drop sometimes stopping after a few reorders until the interface was reloaded.
+- Fixed "Reset Order" not always clearing an older saved order.
+- Reworked how the loadout order is applied and the dropdown refreshed, for better compatibility and stability.
+
 ## v1.9.0
 - Your saved order no longer forgets loadouts that briefly go missing from the list — they return to their spot.
 - New loadouts now appear above Starter Build, like the default list.
