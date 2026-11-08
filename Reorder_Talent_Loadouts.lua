@@ -6,9 +6,9 @@
 
     TAINT MODEL (12.x) -- the whole design follows from these rules:
     * The addon's product is DATA: the order of loadout config IDs. It rewrites
-      `loadSystem.possibleSelections` in place from addon execution, which the
-      workspace rules sanction ("read/sort/mutate restricted data at the data
-      level from addon execution").
+      `loadSystem.possibleSelections` in place from addon execution, which is the
+      supported data-level path (read/sort/mutate the data, never call the
+      frame's restricted methods).
     * No Blizzard method that runs a restricted C read or rebuilds menu
       descriptions is called from addon execution: no RefreshLoadoutOptions,
       no SetSelectionOptions, no UpdateSelectionOptions, no GenerateMenu.
@@ -83,7 +83,10 @@ local function SafeInvoke(scope, fn, ...)
         if not reportedErrors[scope] then
             reportedErrors[scope] = err;
             if DEFAULT_CHAT_FRAME then
-                DEFAULT_CHAT_FRAME:AddMessage("|cffff3333Reorder Talent Loadouts [" .. scope .. "] error:|r " .. err);
+                -- Best-effort report: the error path must stay fail-open too, so a
+                -- refused or throwing AddMessage can never escape into the caller.
+                pcall(DEFAULT_CHAT_FRAME.AddMessage, DEFAULT_CHAT_FRAME,
+                    "|cffff3333Reorder Talent Loadouts [" .. scope .. "] error:|r " .. err);
             end
         end
         return false;
@@ -93,7 +96,8 @@ end
 
 -- Calls a Blizzard function in secure execution when the client provides
 -- securecallfunction (12.x does), so an addon-initiated UI cycle has the same
--- taint profile as the user's own click. Falls back to a plain call in mocks.
+-- taint profile as the user's own click. Falls back to a plain call when the
+-- client does not provide it.
 local function SecureCall(fn, ...)
     if securecallfunction then
         return securecallfunction(fn, ...);
@@ -172,16 +176,40 @@ end
 -- Database & Order Management
 -- ----------------------------------------------------------------------------
 
+-- A hand-edited order can contain a nil hole. ipairs stops at the first hole,
+-- so every entry after it would silently vanish from the next save even though
+-- the client still reports those loadouts. Compact the numeric keys once, in
+-- index order, so a still-existing entry keeps its slot.
+local function CompactOrder(order)
+    local keys, maxIndex = {}, 0;
+    for key in pairs(order) do
+        if type(key) == "number" and key >= 1 and key == math.floor(key) then
+            table.insert(keys, key);
+            if key > maxIndex then maxIndex = key; end
+        end
+    end
+    if #keys == maxIndex then
+        return order; -- already a clean sequence
+    end
+    table.sort(keys);
+    local compact = {};
+    for _, key in ipairs(keys) do
+        table.insert(compact, order[key]);
+    end
+    return compact;
+end
+
 -- An order entry is usable only in its canonical shape. Anything else (a bare
 -- array from hand-editing, a scalar from corruption, a missing names map) is
--- treated as absent -- never raised on. Live databases have carried this shape
--- since v1.0, and every shipped version reads it through this function.
+-- treated as absent -- never raised on. Saved databases have carried this shape
+-- since the first release, and every version reads it through this function.
 local function AsOrderEntry(bucket, specID)
     if type(bucket) ~= "table" then
         return nil;
     end
     local entry = bucket[specID];
     if type(entry) == "table" and type(entry.order) == "table" then
+        entry.order = CompactOrder(entry.order);
         return entry;
     end
     return nil;
@@ -230,7 +258,13 @@ function ns.SaveOrder(playerKey, specID, orderList, configIDToName, fallbackName
 
     local namesMap = {};
     for _, id in ipairs(orderList) do
-        local name = (configIDToName and configIDToName[id]) or (fallbackNames and fallbackNames[id]);
+        -- Empty is not a name: Blizzard writes "" when GetConfigInfo fails for
+        -- an ID. Fall back to the last saved name instead of erasing it, so a
+        -- transient read failure cannot destroy the name-based safety net.
+        local name = configIDToName and configIDToName[id];
+        if not name or name == "" then
+            name = fallbackNames and fallbackNames[id];
+        end
         if name and name ~= "" then
             namesMap[id] = name;
         end
@@ -278,15 +312,23 @@ end
 function ns.MergeAbsent(visible, savedOrder, isGone)
     local inVisible = {};
     for _, id in ipairs(visible) do inVisible[id] = true; end
+    local seen = {};
     local after = {};
     local anchor = false; -- false = before the first visible entry
     for _, id in ipairs(savedOrder or {}) do
         if inVisible[id] then
-            anchor = id;
-        elseif not isGone(id) then
+            -- Only the first occurrence anchors; duplicates are ignored below.
+            if not seen[id] then
+                seen[id] = true;
+                anchor = id;
+            end
+        elseif not seen[id] and not isGone(id) then
+            -- A kept entry is NOT visible, so a duplicate of it must never
+            -- become the anchor: later absent entries would be filed under an
+            -- ID the merge loop never walks and silently disappear.
+            seen[id] = true;
             after[anchor] = after[anchor] or {};
             table.insert(after[anchor], id);
-            inVisible[id] = true; -- duplicates in a hand-edited DB keep one copy
         end
     end
     local merged = {};
@@ -299,21 +341,23 @@ function ns.MergeAbsent(visible, savedOrder, isGone)
 end
 
 -- Saved entries absent from the visible list are dropped from the DB only when the
--- client confirms they no longer exist (or they were re-identified by name).
-local function MakeIsGone(specID, replaced)
+-- client confirms they no longer exist. A name re-identification is a guess
+-- (Blizzard allows duplicate names), so it never purges on its own: only a
+-- successful, non-empty GetConfigIDsBySpecID that lacks the ID proves it is gone.
+local function MakeIsGone(specID)
     local starterID = StarterBuildID();
     local live, queried = nil, false;
     return function(id)
-        if replaced and replaced[id] then return true; end
         -- GetConfigIDsBySpecID does NOT include the Starter Build: Blizzard
         -- appends it separately in RefreshLoadoutOptions. Treating that list as
         -- complete would purge the Starter Build's saved slot whenever the
         -- visible list is degraded (the exact case this fallback exists for).
-        if starterID ~= nil and id == starterID then return false; end
+        if starterID ~= nil and id == starterID then return false; end;
         if not queried then
             queried = true;
             live = GetLiveConfigSet(specID);
         end
+        -- nil live means "unknown", never "everything deleted": keep the slot.
         return live ~= nil and not live[id];
     end;
 end
@@ -359,7 +403,6 @@ function ns.SortConfigIDs(specID, currentConfigIDs, configIDToName)
 
     local result = {};
     local placed = {};
-    local replaced = {};
 
     -- Saved IDs that are still visible are already owned by their own entry.
     -- A name re-identification must never steal one of them: deleting one of two
@@ -370,7 +413,9 @@ function ns.SortConfigIDs(specID, currentConfigIDs, configIDToName)
         if currentSet[savedID] then owned[savedID] = true; end
     end
 
-    -- 1. Place all saved IDs in their saved order
+    -- 1. Place all saved IDs in their saved order. A name re-identification
+    -- never purges the old ID here: MergeAbsent keeps the old slot until a
+    -- successful ground-truth read proves the ID is gone.
     for _, savedID in ipairs(saved.order) do
         local idToPlace = nil;
         if currentSet[savedID] then
@@ -390,12 +435,6 @@ function ns.SortConfigIDs(specID, currentConfigIDs, configIDToName)
         if idToPlace and not placed[idToPlace] then
             table.insert(result, idToPlace);
             placed[idToPlace] = true;
-            -- Only the entry that actually took the slot is "replaced". A second
-            -- saved entry whose name maps to an already-placed ID must not be
-            -- marked gone: it may still exist, merely absent from a degraded list.
-            if idToPlace ~= savedID then
-                replaced[savedID] = true;
-            end
         end
     end
 
@@ -419,7 +458,7 @@ function ns.SortConfigIDs(specID, currentConfigIDs, configIDToName)
     end
 
     -- 3. Persist when the order or any name moved on (no rewrite churn otherwise).
-    local persisted = ns.MergeAbsent(result, saved.order, MakeIsGone(specID, replaced));
+    local persisted = ns.MergeAbsent(result, saved.order, MakeIsGone(specID));
     if not ns.ArraysEqual(persisted, saved.order) or NamesChanged(result, savedNames, configIDToName) then
         ns.SaveOrder(playerKey, specID, persisted, configIDToName, savedNames);
     end
@@ -797,12 +836,17 @@ local function EndGesture()
     dragSourceConfigID = nil;
     currentDropTargetIndex = nil;
 
-    -- Suppress click selection/sound for a brief moment after releasing
+    -- Suppress click selection/sound for a brief moment after releasing.
+    -- Fail-open: the guard window must end even if the client refuses the timer;
+    -- a stuck flag would refuse every loadout click until /reload.
     justFinishedDragging = true;
     if C_Timer and C_Timer.After then
-        C_Timer.After(0.2, function()
+        local scheduled = pcall(C_Timer.After, 0.2, function()
             justFinishedDragging = false;
         end);
+        if not scheduled then
+            justFinishedDragging = false;
+        end
     else
         justFinishedDragging = false;
     end
@@ -885,9 +929,14 @@ function ns.FinishDrag()
 end
 
 function ns.CancelDrag()
-    if isDragging or potentialDrag then
-        EndGesture();
-    end
+    -- Fail-open: this runs from Blizzard's menu-released callback; a throw here
+    -- would abort the menu teardown. State is cleared before any visual restore,
+    -- so a failing restore still leaves no half-armed gesture behind.
+    SafeInvoke("cancelDrag", function()
+        if isDragging or potentialDrag then
+            EndGesture();
+        end
+    end);
 end
 
 function ns.ClearActiveButtons()
@@ -967,13 +1016,13 @@ end
 -- across every menu in the game, so every handler acts only while the button is a
 -- tracked loadout row.
 --
--- IMPORTANT (live regression, 2026-11-03): menu element frames are released to a
--- shared pool on EVERY menu close (Menu.lua DiscardChildFrames -> MenuElementFactory
+-- IMPORTANT (pooled menu rows): menu element frames are released to a shared pool
+-- on EVERY menu close (Menu.lua DiscardChildFrames -> MenuElementFactory
 -- :Release), and releasing one runs ResetMenuElement -> SetToDefaults, which returns
 -- the frame to "just-created" state and drops its scripts. Our drop path closes and
 -- reopens the menu after every move, so a once-only HookScript on OnDragStart/
--- OnDragStop silently stopped firing after the first close: drags died after a
--- couple of moves and only /reload brought them back. Re-set the drag scripts on
+-- OnDragStop silently stops firing after the first close: drags die after a
+-- couple of moves and only /reload brings them back. Re-set the drag scripts on
 -- every generation, and re-hook the mouse handlers when the frame came back reset.
 function ns.SetupLoadoutButton(button, description, menu, configID)
     local entry = ns.FindTrackedEntry(button);
@@ -1393,10 +1442,12 @@ local function CreateResetButton(talentsFrame, dropdown)
             self.Icon:SetPoint("CENTER", self, "CENTER", 1, -1); -- press-depress visual
         end
         self:Hide();
-        SafeInvoke("resetButton", function()
-            ns.ResetCurrentSpecOrder();
-            if C_Timer and C_Timer.After then
-                C_Timer.After(0, function()
+        SafeInvoke("resetButton", ns.ResetCurrentSpecOrder);
+        -- Scheduled regardless of the reset's success: the outside press already
+        -- closed the menu, and leaving it closed is worse than an unapplied reset.
+        if C_Timer and C_Timer.After then
+            C_Timer.After(0, function()
+                SafeInvoke("resetReopen", function()
                     local tf = GetTalentsFrame();
                     local ls = tf and tf.LoadSystem;
                     local dd = ls and ls.GetDropdown and ls:GetDropdown();
@@ -1406,8 +1457,8 @@ local function CreateResetButton(talentsFrame, dropdown)
                     end
                     UpdateResetButton();
                 end);
-            end
-        end);
+            end);
+        end
     end);
     btn:SetScript("OnMouseUp", function(self)
         if self.Icon then
@@ -1462,21 +1513,31 @@ EnsureChrome = function(talentsFrame)
     if not menuCallbacksInstalled and dropdown.RegisterCallback and DropdownButtonMixin and DropdownButtonMixin.Event then
         menuCallbacksInstalled = true;
         pcall(dropdown.RegisterCallback, dropdown, DropdownButtonMixin.Event.OnMenuOpen, function()
-            UpdateResetButton();
+            -- Fail-open: this runs inside Blizzard's OpenMenu; a throw here would
+            -- abort the dropdown's own open path.
+            SafeInvoke("resetOnOpen", UpdateResetButton);
         end);
         pcall(dropdown.RegisterCallback, dropdown, DropdownButtonMixin.Event.OnMenuClose, function()
             -- Hidden next frame: visually instant, but still ordered after the current
             -- input dispatch so a press landing on the button as the menu closes (outside
             -- click) always reaches the button's OnMouseDown first (reset happens on press).
-            if C_Timer and C_Timer.After then
-                C_Timer.After(0, function()
-                    if resetButton and not ddOpen(dropdown) then
+            SafeInvoke("resetOnClose", function()
+                if C_Timer and C_Timer.After then
+                    -- Fail-open: the hide must not depend on a successful
+                    -- schedule; a refused timer would leave the button visible
+                    -- next to a closed dropdown until the next refresh.
+                    local scheduled = pcall(C_Timer.After, 0, function()
+                        if resetButton and not ddOpen(dropdown) then
+                            resetButton:Hide();
+                        end
+                    end);
+                    if not scheduled and resetButton then
                         resetButton:Hide();
                     end
-                end);
-            elseif resetButton then
-                resetButton:Hide();
-            end
+                elseif resetButton then
+                    resetButton:Hide();
+                end
+            end);
         end);
     end
 
@@ -1515,13 +1576,13 @@ InitializeTalentHooks = function()
 end
 
 ns.InitializeTalentHooks = InitializeTalentHooks;
-ns._ResetHookStateForTest = function() -- private-suite seam: re-run installation
+ns._ResetHookStateForTest = function() -- internal seam: re-run installation
     hooksInstalled = false;
     paneHooked = false;
     menuCallbacksInstalled = false;
-    -- Pending timers and once-per-scope error reports must not leak across tests
-    -- (a captured timer that never runs would silence later refresh/reconcile;
-    -- a consumed error scope would hide a later failure).
+    -- Pending timers and once-per-scope error reports must not leak across a
+    -- re-installation (a captured timer that never runs would silence later
+    -- refresh/reconcile; a consumed error scope would hide a later failure).
     reconcilePending = false;
     wipe(refreshPending);
     wipe(reportedErrors);
@@ -1556,9 +1617,10 @@ end
 local function IsAddOnLoadedSafe(addonName)
     if C_AddOns and C_AddOns.IsAddOnLoaded then
         return C_AddOns.IsAddOnLoaded(addonName);
-    elseif IsAddOnLoaded then
-        return IsAddOnLoaded(addonName);
     end
+    -- No bare IsAddOnLoaded fallback: 12.1.5 documents the name only as
+    -- C_AddOns.IsAddOnLoaded and the client has no such global (the dump's own
+    -- FrameXML never reads one).
     return false;
 end
 
@@ -1588,8 +1650,9 @@ local function OnAddonEvent(self, event, arg1, arg2)
                 end
             end
         else
-            -- Loading-screen zone change (dungeon/arena/instance entry): Blizzard
-            -- repopulates the dropdown for the new zone, so re-sort right away.
+            -- Loading-screen zone change (dungeon/arena/instance entry): the
+            -- dropdown's data may have been repopulated across the transition,
+            -- so reconcile after Blizzard's own loading-screen handlers.
             ScheduleReconcile();
         end
     elseif event == "ZONE_CHANGED" or event == "ZONE_CHANGED_NEW_AREA" then

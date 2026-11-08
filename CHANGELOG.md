@@ -1,5 +1,10 @@
 # Reorder Talent Loadouts Changelog
 
+## v1.10.1
+- Saved loadout positions are kept when the game briefly cannot report a loadout's name (for example right after a patch or server transfer), instead of losing the name needed to restore them later.
+- A name-based recovery no longer discards a loadout's saved position while the game's loadout list is temporarily unreadable.
+- Fixed a damaged saved order being able to drop other saved loadouts from the list.
+
 ## v1.10.0
 - Fixed the player cast bar occasionally disappearing until the interface was reloaded after changing loadouts (World of Warcraft: Midnight).
 - Fixed the Starter Build losing its saved position after a temporary glitch in the loadout list.
